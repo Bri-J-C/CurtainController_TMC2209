@@ -13,6 +13,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
@@ -51,7 +52,7 @@ bool tmc_available = false;
 
 // TMC2209 settings
 uint16_t motor_current_ma = 800;
-uint16_t motor_microsteps = 16;
+uint16_t motor_microsteps = 2;
 uint8_t stall_threshold = 50;
 bool tmc_verbose = false;  // Verbose mode for TMC diagnostics
 
@@ -68,7 +69,7 @@ unsigned long last_position_report = 0;
 const unsigned long POSITION_REPORT_INTERVAL = 500;
 
 // Motor state
-int step_delay_us = 800;
+int step_delay_us = 2000;
 bool motor_enabled = false;
 unsigned long motor_sleep_timeout = 30000;
 unsigned long last_motor_activity = 0;
@@ -87,8 +88,6 @@ unsigned long button_press_start = 0;
 unsigned long last_button_change = 0;
 bool button_state = HIGH;
 bool last_stable_state = HIGH;
-bool reset_in_progress = false;
-bool ap_triggered = false;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 const unsigned long AP_HOLD_MIN = 3000;
 const unsigned long AP_HOLD_MAX = 5000;
@@ -103,6 +102,8 @@ bool led_desired_state = HIGH;
 unsigned long last_mqtt_attempt = 0;
 int mqtt_retry_delay = 2000;
 const int MAX_MQTT_RETRY_DELAY = 60000;
+unsigned long mqtt_subscribe_time = 0;
+const unsigned long MQTT_IGNORE_RETAINED_MS = 2000;
 
 // WiFi reconnection state machine
 enum WiFiReconnectState { WIFI_CONNECTED, WIFI_DISCONNECTED, WIFI_RECONNECTING };
@@ -111,6 +112,7 @@ unsigned long wifi_reconnect_start = 0;
 const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;
 
 volatile bool ws_command_pending = false;
+const char* last_reset_reason = "Unknown";
 
 // Network
 WiFiClient espClient;
@@ -127,6 +129,15 @@ String mqtt_command_topic;
 String mqtt_stat_topic;
 String mqtt_position_topic;
 String mqtt_availability_topic;
+String mqtt_calibrate_topic;
+String mqtt_speed_set_topic;
+String mqtt_speed_state_topic;
+String mqtt_current_set_topic;
+String mqtt_current_state_topic;
+String mqtt_stallthreshold_set_topic;
+String mqtt_stallthreshold_state_topic;
+String mqtt_microsteps_set_topic;
+String mqtt_microsteps_state_topic;
 String ws_pending_command;
 
 // ============================================================================
@@ -151,6 +162,9 @@ void save_position();
 void publish_status(const char* status);
 void publish_position();
 void publish_ha_discovery(bool force = false);
+void publish_settings_state();
+static const char* sensitivity_name(uint8_t thr);
+void publish_sensitivity_state();
 void process_command(const String& command);
 void stop_motor();
 void wake_motor();
@@ -161,27 +175,49 @@ void start_calibration();
 void check_tmc_errors();
 
 // ============================================================================
-// WEBSERIAL HELPERS
+// LOGGING SYSTEM
 // ============================================================================
 
-void ws_println(const String& s) {
-  WebSerial.println(s);
-  yield();  // Let WiFi/WebSocket process
+enum LogLevel { LOG_ERROR, LOG_WARN, LOG_INFO, LOG_DEBUG };
+LogLevel current_log_level = LOG_INFO;
+
+static const char* log_level_name(LogLevel level) {
+  switch (level) {
+    case LOG_ERROR: return "ERROR";
+    case LOG_WARN:  return "WARN ";
+    case LOG_INFO:  return "INFO ";
+    case LOG_DEBUG: return "DEBUG";
+    default:        return "?????";
+  }
 }
 
-void ws_print(const String& s) {
-  WebSerial.print(s);
-  yield();
-}
+void log_msg(LogLevel level, const char* subsystem, const char* fmt, ...) {
+  if (level > current_log_level) return;
 
-void ws_printf(const char* fmt, ...) {
-  char buffer[256];
+  char msg[256];
   va_list args;
   va_start(args, fmt);
-  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  vsnprintf(msg, sizeof(msg), fmt, args);
   va_end(args);
-  WebSerial.print(buffer);
-  yield();
+
+  char line[300];
+  snprintf(line, sizeof(line), "[%s] [%s] %s", log_level_name(level), subsystem, msg);
+
+  Serial.println(line);
+  if (WebSerial.getConnectionCount() > 0)
+    WebSerial.println(line);
+}
+
+// For structured command output (status, config, help, etc.) — no prefix
+void output(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  if (WebSerial.getConnectionCount() > 0)
+    WebSerial.print(buf);
 }
 
 // ============================================================================
@@ -207,7 +243,7 @@ void setup_tmc2209() {
   digitalWrite(ENABLE_PIN, HIGH);  // Disabled
 
   // Initialize UART for TMC2209
-  Serial.println(F("Initializing TMC2209 UART..."));
+  log_msg(LOG_INFO, "TMC", "Initializing TMC2209 UART...");
   TMCSerial.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
   TMCSerial.setTimeout(100);
   delay(200);
@@ -217,23 +253,22 @@ void setup_tmc2209() {
   delay(50);
 
   // Test communication
-  Serial.println(F("Testing TMC2209 communication..."));
+  log_msg(LOG_INFO, "TMC", "Testing TMC2209 communication...");
   uint8_t result = driver.test_connection();
 
   if (result != 0) {
-    Serial.printf("TMC2209 comm test returned: %d\n", result);
+    log_msg(LOG_DEBUG, "TMC", "Comm test returned: %d", result);
 
     uint32_t ioin = driver.IOIN();
-    Serial.printf("IOIN register: 0x%08X\n", ioin);
+    log_msg(LOG_DEBUG, "TMC", "IOIN register: 0x%08X", ioin);
 
     if (ioin == 0 || ioin == 0xFFFFFFFF) {
-      Serial.println(F("TMC2209 not responding!"));
-      Serial.println(F("Wiring: GPIO21(TX)--[1K]-->PDN_UART, GPIO20(RX)-->PDN_UART"));
-      Serial.println(F("Motor control will be limited."));
+      log_msg(LOG_ERROR, "TMC", "TMC2209 not responding! Check wiring: GPIO21(TX)--[1K]-->PDN_UART, GPIO20(RX)-->PDN_UART");
+      log_msg(LOG_WARN, "TMC", "Motor control will be limited");
       tmc_available = false;
       return;
     }
-    Serial.println(F("TMC2209 responding, continuing setup..."));
+    log_msg(LOG_INFO, "TMC", "TMC2209 responding, continuing setup...");
   }
 
   tmc_available = true;
@@ -261,7 +296,7 @@ void setup_tmc2209() {
   // Attach interrupt for stall detection
   attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stall_isr, RISING);
 
-  Serial.println(F("TMC2209 initialized successfully"));
+  log_msg(LOG_INFO, "TMC", "TMC2209 initialized successfully");
 }
 
 void set_motor_current(uint16_t ma) {
@@ -302,9 +337,16 @@ void check_tmc_errors() {
   bool ola = drv_status & (1 << 6);     // Open load A
   bool olb = drv_status & (1 << 7);     // Open load B
 
+  if (otpw && !ot) {
+    log_msg(LOG_WARN, "TMC", "Overtemperature pre-warning");
+  }
+  if (ola || olb) {
+    log_msg(LOG_WARN, "TMC", "Open load detected (A:%d B:%d)", ola, olb);
+  }
+
   if (ot || s2ga || s2gb) {
     // Serious error - disable and re-enable
-    Serial.println(F("TMC2209 error detected, resetting..."));
+    log_msg(LOG_ERROR, "TMC", "Hardware error: OT:%d S2GA:%d S2GB:%d — resetting", ot, s2ga, s2gb);
     stop_motor();
     delay(50);
     yield();
@@ -350,15 +392,13 @@ void save_position() {
 void start_movement(int target) {
   if (is_moving || cal_state != CAL_IDLE) return;
   if (!tmc_available) {
-    Serial.println(F("TMC2209 not available"));
-    ws_println(F("TMC2209 not available"));
+    log_msg(LOG_ERROR, "MOTOR", "TMC2209 not available, cannot move");
     return;
   }
 
   target_position = constrain(target, 0, steps_per_revolution);
   if (current_position == target_position) {
-    Serial.println(F("Already at position"));
-    ws_println(F("Already at position"));
+    log_msg(LOG_INFO, "MOTOR", "Already at position %d", current_position);
     return;
   }
 
@@ -367,9 +407,15 @@ void start_movement(int target) {
 
   if (target_position > current_position) {
     digitalWrite(DIR_PIN, HIGH);
+    log_msg(LOG_INFO, "MOTOR", "Opening: %d -> %d (%d%%)",
+            current_position, target_position,
+            (target_position * 100) / steps_per_revolution);
     publish_status("opening");
   } else {
     digitalWrite(DIR_PIN, LOW);
+    log_msg(LOG_INFO, "MOTOR", "Closing: %d -> %d (%d%%)",
+            current_position, target_position,
+            (target_position * 100) / steps_per_revolution);
     publish_status("closing");
   }
 
@@ -391,13 +437,7 @@ void stop_movement(const char* reason) {
 
   const char* status;
   if (strcmp(reason, "Complete") == 0) {
-    if (current_position >= steps_per_revolution) {
-      status = "open";
-    } else if (current_position <= 0) {
-      status = "closed";
-    } else {
-      status = "open";
-    }
+    status = (current_position <= 0) ? "closed" : "open";
   } else {
     status = "stopped";
   }
@@ -417,12 +457,13 @@ void handle_movement() {
   // Log stall events in verbose mode (but don't stop - stalls ignored during normal movement)
   if (stall_flag && tmc_verbose && tmc_available) {
     uint16_t sg = driver.SG_RESULT();
-    Serial.printf("[STALL DETECTED] SG:%d threshold:%d (triggers at SG<%d)\n", sg, stall_threshold, stall_threshold * 2);
-    ws_printf("[STALL DETECTED] SG:%d thr:%d\n", sg, stall_threshold);
+    log_msg(LOG_WARN, "MOTOR", "Stall detected SG:%d thr:%d (triggers at SG<%d)",
+            sg, stall_threshold, stall_threshold * 2);
   }
   stall_flag = false;
 
   if (millis() - movement_start_time > MOVEMENT_TIMEOUT) {
+    log_msg(LOG_ERROR, "MOTOR", "Movement timeout after %lums", MOVEMENT_TIMEOUT);
     publish_status("error_timeout");
     stop_movement("Timeout");
     return;
@@ -447,6 +488,8 @@ void handle_movement() {
     }
 
     if (current_position == target_position) {
+      log_msg(LOG_INFO, "MOTOR", "Movement complete, position %d (%d%%)",
+              current_position, (current_position * 100) / steps_per_revolution);
       stop_movement("Complete");
     }
   }
@@ -460,8 +503,8 @@ void handle_movement() {
       uint16_t sg = driver.SG_RESULT();
       uint32_t drv = driver.DRV_STATUS();
       uint8_t cs = (drv >> 16) & 0x1F;  // Current scale
-      Serial.printf("[TMC] SG:%3d CS:%2d/31 DIAG:%d\n", sg, cs, digitalRead(DIAG_PIN));
-      ws_printf("[TMC] SG:%3d CS:%2d/31 DIAG:%d\n", sg, cs, digitalRead(DIAG_PIN));
+      log_msg(LOG_DEBUG, "MOTOR", "SG:%3d CS:%2d/31 DIAG:%d pos:%d",
+              sg, cs, digitalRead(DIAG_PIN), current_position);
     }
   }
 }
@@ -472,18 +515,15 @@ void handle_movement() {
 
 void start_calibration() {
   if (!tmc_available) {
-    Serial.println(F("Cannot calibrate: TMC2209 not available"));
-    ws_println(F("Cannot calibrate: TMC2209 not available"));
+    log_msg(LOG_ERROR, "CAL", "Cannot calibrate: TMC2209 not available");
     return;
   }
   if (is_moving || cal_state != CAL_IDLE) {
-    Serial.println(F("Cannot calibrate: busy"));
-    ws_println(F("Cannot calibrate: busy"));
+    log_msg(LOG_WARN, "CAL", "Cannot calibrate: motor busy");
     return;
   }
 
-  Serial.println(F("Starting calibration - finding closed position..."));
-  ws_println(F("Starting calibration - finding closed position..."));
+  log_msg(LOG_INFO, "CAL", "Starting sensorless calibration — finding closed position...");
 
   wake_motor();
   stall_flag = false;
@@ -512,8 +552,7 @@ void handle_calibration() {
 
   // Timeout
   if (millis() - cal_start_time > CAL_TIMEOUT) {
-    Serial.println(F("Calibration timeout!"));
-    ws_println(F("Calibration timeout!"));
+    log_msg(LOG_ERROR, "CAL", "Calibration timeout after %lums", CAL_TIMEOUT);
     cal_state = CAL_IDLE;
     is_moving = false;
     return;
@@ -535,15 +574,13 @@ void handle_calibration() {
         // Log the stall detection
         if (tmc_available) {
           uint16_t sg = driver.SG_RESULT();
-          Serial.printf("[CAL STALL] SG:%d threshold:%d\n", sg, stall_threshold);
-          ws_printf("[CAL STALL] SG:%d thr:%d\n", sg, stall_threshold);
+          log_msg(LOG_DEBUG, "CAL", "Stall detected SG:%d thr:%d", sg, stall_threshold);
         }
 
         if (cal_state == CAL_FIND_MIN) {
           current_position = 0;
           save_position();
-          Serial.println(F("Found closed position"));
-          ws_println(F("Found closed position"));
+          log_msg(LOG_INFO, "CAL", "Found closed position (min)");
 
           delay(30);
           yield();
@@ -561,13 +598,11 @@ void handle_calibration() {
           stall_flag = false;
           cal_last_stall_check = millis();
           cal_state = CAL_FIND_MAX;
-          Serial.println(F("Finding open position..."));
-          ws_println(F("Finding open position..."));
+          log_msg(LOG_INFO, "CAL", "Finding open position (max)...");
 
         } else if (cal_state == CAL_FIND_MAX) {
           int total = current_position;
-          Serial.printf("Found open position at %d steps\n", total);
-          ws_printf("Found open position at %d steps\n", total);
+          log_msg(LOG_INFO, "CAL", "Found open position at %d steps", total);
 
           delay(30);
           yield();
@@ -590,8 +625,7 @@ void handle_calibration() {
           preferences.putInt("steps_per_rev", steps_per_revolution);
           save_position();
 
-          Serial.printf("Calibration complete! Range: %d steps\n", steps_per_revolution);
-          ws_printf("Calibration complete! Range: %d steps\n", steps_per_revolution);
+          log_msg(LOG_INFO, "CAL", "Calibration complete! Range: %d steps", steps_per_revolution);
 
           cal_state = CAL_IDLE;
           is_moving = false;
@@ -679,26 +713,250 @@ void publish_ha_discovery(bool force) {
   String json;
   serializeJson(doc, json);
 
-  Serial.printf("HA Discovery payload size: %d bytes\n", json.length());
-  ws_printf("HA Discovery payload size: %d bytes\n", json.length());
+  log_msg(LOG_DEBUG, "MQTT", "HA Discovery payload: %d bytes", json.length());
 
   if (client.publish(discovery_topic.c_str(), json.c_str(), true)) {
     preferences.putBool("ha_disc_done", true);
-    Serial.println("HA Discovery published successfully");
-    ws_println("HA Discovery published successfully");
+    log_msg(LOG_INFO, "MQTT", "HA Discovery published");
   } else {
-    Serial.println("HA Discovery publish FAILED");
-    ws_println("HA Discovery publish FAILED");
+    log_msg(LOG_ERROR, "MQTT", "HA Discovery publish FAILED");
   }
+
+  // Publish calibrate button entity
+  String cal_discovery_topic = "homeassistant/button/" + device_hostname + "_calibrate/config";
+
+  StaticJsonDocument<512> cal_doc;
+  cal_doc["name"] = "Calibrate";
+  cal_doc["unique_id"] = "curtain_" + device_hostname + "_calibrate";
+  cal_doc["object_id"] = device_hostname + "_calibrate";
+  cal_doc["command_topic"] = mqtt_calibrate_topic;
+  cal_doc["payload_press"] = "press";
+  cal_doc["availability_topic"] = mqtt_availability_topic;
+  cal_doc["payload_available"] = "online";
+  cal_doc["payload_not_available"] = "offline";
+  cal_doc["icon"] = "mdi:tape-measure";
+
+  JsonObject cal_device = cal_doc.createNestedObject("device");
+  JsonArray cal_ids = cal_device.createNestedArray("identifiers");
+  cal_ids.add("curtain_" + WiFi.macAddress());
+  cal_device["name"] = device_hostname;
+
+  String cal_json;
+  serializeJson(cal_doc, cal_json);
+
+  if (client.publish(cal_discovery_topic.c_str(), cal_json.c_str(), true)) {
+    log_msg(LOG_INFO, "MQTT", "HA Calibrate button published");
+  } else {
+    log_msg(LOG_ERROR, "MQTT", "HA Calibrate button publish FAILED");
+  }
+
+  // Speed number entity
+  {
+    String topic = "homeassistant/number/" + device_hostname + "_speed/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "Speed";
+    doc["unique_id"] = "curtain_" + device_hostname + "_speed";
+    doc["object_id"] = device_hostname + "_speed";
+    doc["command_topic"] = mqtt_speed_set_topic;
+    doc["state_topic"] = mqtt_speed_state_topic;
+    doc["min"] = 100;
+    doc["max"] = 10000;
+    doc["step"] = 100;
+    doc["unit_of_measurement"] = "us";
+    doc["icon"] = "mdi:speedometer";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
+  // Motor current number entity
+  {
+    String topic = "homeassistant/number/" + device_hostname + "_current/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "Motor Current";
+    doc["unique_id"] = "curtain_" + device_hostname + "_current";
+    doc["object_id"] = device_hostname + "_current";
+    doc["command_topic"] = mqtt_current_set_topic;
+    doc["state_topic"] = mqtt_current_state_topic;
+    doc["min"] = 100;
+    doc["max"] = 2000;
+    doc["step"] = 100;
+    doc["unit_of_measurement"] = "mA";
+    doc["icon"] = "mdi:current-ac";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
+  // Sensitivity select entity
+  {
+    String topic = "homeassistant/select/" + device_hostname + "_sensitivity/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "Stall Sensitivity";
+    doc["unique_id"] = "curtain_" + device_hostname + "_sensitivity";
+    doc["object_id"] = device_hostname + "_sensitivity";
+    doc["command_topic"] = mqtt_stallthreshold_set_topic;
+    doc["state_topic"] = mqtt_stallthreshold_state_topic;
+    JsonArray options = doc.createNestedArray("options");
+    options.add("low"); options.add("medium"); options.add("high");
+    doc["icon"] = "mdi:gauge";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
+  // Microsteps select entity
+  {
+    String topic = "homeassistant/select/" + device_hostname + "_microsteps/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "Microsteps";
+    doc["unique_id"] = "curtain_" + device_hostname + "_microsteps";
+    doc["object_id"] = device_hostname + "_microsteps";
+    doc["command_topic"] = mqtt_microsteps_set_topic;
+    doc["state_topic"] = mqtt_microsteps_state_topic;
+    JsonArray options = doc.createNestedArray("options");
+    options.add("1"); options.add("2"); options.add("4"); options.add("8");
+    options.add("16"); options.add("32"); options.add("64"); options.add("128"); options.add("256");
+    doc["icon"] = "mdi:stairs";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
+  // Remove old stallthreshold number entity (replaced by sensitivity select)
+  String old_topic = "homeassistant/number/" + device_hostname + "_stallthreshold/config";
+  client.publish(old_topic.c_str(), "", true);
+
+  log_msg(LOG_INFO, "MQTT", "HA settings entities published");
+}
+
+void publish_settings_state() {
+  if (!client.connected()) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", step_delay_us);
+  client.publish(mqtt_speed_state_topic.c_str(), buf, true);
+  snprintf(buf, sizeof(buf), "%d", motor_current_ma);
+  client.publish(mqtt_current_state_topic.c_str(), buf, true);
+  client.publish(mqtt_stallthreshold_state_topic.c_str(), sensitivity_name(stall_threshold), true);
+  snprintf(buf, sizeof(buf), "%d", motor_microsteps);
+  client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
+  String msg((char*)payload, length);
   msg.trim();
-  process_command(msg);
+  msg.toLowerCase();
+  log_msg(LOG_DEBUG, "MQTT", "Received on %s: %s", topic, msg.c_str());
+
+  // Settings topics
+  if (strcmp(topic, mqtt_speed_set_topic.c_str()) == 0) {
+    int value = msg.toInt();
+    if (value >= 100 && value <= 10000) {
+      step_delay_us = value;
+      preferences.putInt("step_delay", step_delay_us);
+      log_msg(LOG_INFO, "MQTT", "Speed set to %d us", step_delay_us);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", step_delay_us);
+      client.publish(mqtt_speed_state_topic.c_str(), buf, true);
+    }
+    return;
+  }
+  if (strcmp(topic, mqtt_current_set_topic.c_str()) == 0) {
+    int value = msg.toInt();
+    if (value >= 100 && value <= 2000) {
+      set_motor_current(value);
+      log_msg(LOG_INFO, "MQTT", "Current set to %d mA", motor_current_ma);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", motor_current_ma);
+      client.publish(mqtt_current_state_topic.c_str(), buf, true);
+    }
+    return;
+  }
+  if (strcmp(topic, mqtt_stallthreshold_set_topic.c_str()) == 0) {
+    uint8_t value;
+    if (msg == "low") value = 15;
+    else if (msg == "medium") value = 30;
+    else if (msg == "high") value = 60;
+    else return;
+    set_stall_threshold(value);
+    log_msg(LOG_INFO, "MQTT", "Sensitivity set to %s (threshold=%d)", msg.c_str(), stall_threshold);
+    publish_sensitivity_state();
+    return;
+  }
+  if (strcmp(topic, mqtt_microsteps_set_topic.c_str()) == 0) {
+    int value = msg.toInt();
+    if (value == 1 || value == 2 || value == 4 || value == 8 || value == 16 ||
+        value == 32 || value == 64 || value == 128 || value == 256) {
+      set_motor_microsteps(value);
+      log_msg(LOG_INFO, "MQTT", "Microsteps set to %d", motor_microsteps);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", motor_microsteps);
+      client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
+    }
+    return;
+  }
+
+  // Calibrate button topic
+  if (strcmp(topic, mqtt_calibrate_topic.c_str()) == 0) {
+    if (msg == "press") {
+      cmd_calibrate("");
+    }
+    return;
+  }
+
+  // Ignore retained messages delivered right after subscribing
+  if (millis() - mqtt_subscribe_time < MQTT_IGNORE_RETAINED_MS) {
+    log_msg(LOG_DEBUG, "MQTT", "Ignoring retained command: %s", msg.c_str());
+    return;
+  }
+
+  // Only allow safe commands via MQTT: open/close/stop and bare percentages
+  if (msg == "open" || msg == "close" || msg == "stop") {
+    process_command(msg);
+    return;
+  }
+
+  // Allow bare percentage numbers (HA position control)
+  if (msg.length() > 0) {
+    bool all_digits = true;
+    for (size_t i = 0; i < msg.length(); i++) {
+      if (!isDigit(msg.charAt(i))) { all_digits = false; break; }
+    }
+    if (all_digits) {
+      process_command(msg);
+      return;
+    }
+  }
+
+  log_msg(LOG_WARN, "MQTT", "Ignored unknown command: %s", msg.c_str());
 }
 
 void connect_mqtt() {
@@ -708,26 +966,39 @@ void connect_mqtt() {
 
   last_mqtt_attempt = millis();
 
-  String client_id = device_hostname + "_" + WiFi.macAddress();
-  client_id.replace(":", "");
+  char client_id[80];
+  {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    snprintf(client_id, sizeof(client_id), "%s_%s", device_hostname.c_str(), mac.c_str());
+  }
 
   bool connected;
   if (mqtt_user.length() > 0) {
-    connected = client.connect(client_id.c_str(), mqtt_user.c_str(), mqtt_password.c_str(),
+    connected = client.connect(client_id, mqtt_user.c_str(), mqtt_password.c_str(),
                               mqtt_availability_topic.c_str(), 1, true, "offline");
   } else {
-    connected = client.connect(client_id.c_str(), mqtt_availability_topic.c_str(), 1, true, "offline");
+    connected = client.connect(client_id, mqtt_availability_topic.c_str(), 1, true, "offline");
   }
 
   if (connected) {
+    log_msg(LOG_INFO, "MQTT", "Connected to %s:%d", mqtt_server.c_str(), mqtt_port);
+    mqtt_subscribe_time = millis();
     client.subscribe(mqtt_command_topic.c_str());
+    client.subscribe(mqtt_calibrate_topic.c_str());
+    client.subscribe(mqtt_speed_set_topic.c_str());
+    client.subscribe(mqtt_current_set_topic.c_str());
+    client.subscribe(mqtt_stallthreshold_set_topic.c_str());
+    client.subscribe(mqtt_microsteps_set_topic.c_str());
     client.publish(mqtt_availability_topic.c_str(), "online", true);
     publish_position();
     publish_status(current_position >= steps_per_revolution ? "open" :
                    current_position <= 0 ? "closed" : "open");
     publish_ha_discovery();
+    publish_settings_state();
     mqtt_retry_delay = 2000;
   } else {
+    log_msg(LOG_WARN, "MQTT", "Connection failed (rc=%d), retry in %dms", client.state(), mqtt_retry_delay);
     mqtt_retry_delay = min(mqtt_retry_delay * 2, MAX_MQTT_RETRY_DELAY);
   }
 }
@@ -743,8 +1014,17 @@ void setup_mqtt() {
   mqtt_stat_topic = mqtt_root_topic + "/status";
   mqtt_position_topic = mqtt_root_topic + "/position";
   mqtt_availability_topic = mqtt_root_topic + "/availability";
+  mqtt_calibrate_topic = mqtt_root_topic + "/calibrate";
+  mqtt_speed_set_topic = mqtt_root_topic + "/speed/set";
+  mqtt_speed_state_topic = mqtt_root_topic + "/speed/state";
+  mqtt_current_set_topic = mqtt_root_topic + "/current/set";
+  mqtt_current_state_topic = mqtt_root_topic + "/current/state";
+  mqtt_stallthreshold_set_topic = mqtt_root_topic + "/stallthreshold/set";
+  mqtt_stallthreshold_state_topic = mqtt_root_topic + "/stallthreshold/state";
+  mqtt_microsteps_set_topic = mqtt_root_topic + "/microsteps/set";
+  mqtt_microsteps_state_topic = mqtt_root_topic + "/microsteps/state";
 
-  client.setBufferSize(1536);
+  client.setBufferSize(2048);
   client.setServer(mqtt_server.c_str(), mqtt_port);
   client.setCallback(mqtt_callback);
 
@@ -756,41 +1036,22 @@ void setup_mqtt() {
 // ============================================================================
 
 void cmd_open(const String& param) {
+  log_msg(LOG_INFO, "CMD", "open");
   start_movement(steps_per_revolution);
-  String msg = "Opening curtain...";
-  Serial.println(msg);
-  ws_println(msg);
 }
 
 void cmd_close(const String& param) {
+  log_msg(LOG_INFO, "CMD", "close");
   start_movement(0);
-  String msg = "Closing curtain...";
-  Serial.println(msg);
-  ws_println(msg);
 }
 
 void cmd_stop(const String& param) {
+  log_msg(LOG_INFO, "CMD", "stop");
   if (cal_state != CAL_IDLE) {
     cal_state = CAL_IDLE;
-    Serial.println(F("Calibration cancelled"));
-    ws_println(F("Calibration cancelled"));
+    log_msg(LOG_INFO, "CAL", "Calibration cancelled by user");
   }
   stop_movement("User command");
-  String msg = "Stopped";
-  Serial.println(msg);
-  ws_println(msg);
-}
-
-void cmd_position(const String& param) {
-  int pos = param.toInt();
-  if (pos >= 0 && pos <= steps_per_revolution) {
-    start_movement(pos);
-    Serial.printf("Moving to position %d\n", pos);
-    ws_printf("Moving to position %d\n", pos);
-  } else {
-    Serial.printf("[ERROR] Position must be 0-%d\n", steps_per_revolution);
-    ws_printf("[ERROR] Position must be 0-%d\n", steps_per_revolution);
-  }
 }
 
 void cmd_speed(const String& param) {
@@ -798,12 +1059,14 @@ void cmd_speed(const String& param) {
   if (value >= 100 && value <= 10000) {
     step_delay_us = value;
     preferences.putInt("step_delay", step_delay_us);
-    Serial.printf("Speed: %d us/step\n", step_delay_us);
-    ws_printf("Speed: %d us/step\n", step_delay_us);
+    log_msg(LOG_INFO, "NVS", "Speed set to %d us/step", step_delay_us);
+    if (client.connected()) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", step_delay_us);
+      client.publish(mqtt_speed_state_topic.c_str(), buf, true);
+    }
   } else {
-    String msg = "[ERROR] Speed must be 100-10000 us";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "speed: value must be 100-10000 us (got %d)", value);
   }
 }
 
@@ -812,12 +1075,14 @@ void cmd_microsteps(const String& param) {
   if (value == 1 || value == 2 || value == 4 || value == 8 ||
       value == 16 || value == 32 || value == 64 || value == 128 || value == 256) {
     set_motor_microsteps(value);
-    Serial.printf("Microsteps: %d\n", motor_microsteps);
-    ws_printf("Microsteps: %d\n", motor_microsteps);
+    log_msg(LOG_INFO, "NVS", "Microsteps set to %d", motor_microsteps);
+    if (client.connected()) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", motor_microsteps);
+      client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
+    }
   } else {
-    String msg = "[ERROR] Microsteps must be 1,2,4,8,16,32,64,128,256";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "microsteps: must be 1,2,4,8,16,32,64,128,256 (got %d)", value);
   }
 }
 
@@ -825,47 +1090,76 @@ void cmd_current(const String& param) {
   int value = param.toInt();
   if (value >= 100 && value <= 2000) {
     set_motor_current(value);
-    Serial.printf("Current: %d mA\n", motor_current_ma);
-    ws_printf("Current: %d mA\n", motor_current_ma);
+    log_msg(LOG_INFO, "NVS", "Current set to %d mA", motor_current_ma);
+    if (client.connected()) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", motor_current_ma);
+      client.publish(mqtt_current_state_topic.c_str(), buf, true);
+    }
   } else {
-    String msg = "[ERROR] Current must be 100-2000 mA";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "current: must be 100-2000 mA (got %d)", value);
   }
 }
 
-void cmd_stallthreshold(const String& param) {
-  int value = param.toInt();
-  if (value >= 0 && value <= 255) {
-    set_stall_threshold(value);
-    Serial.printf("Stall threshold: %d\n", stall_threshold);
-    ws_printf("Stall threshold: %d\n", stall_threshold);
+// Map sensitivity name to SGTHRS value
+static const char* sensitivity_name(uint8_t thr) {
+  if (thr <= 20) return "low";
+  if (thr <= 45) return "medium";
+  if (thr <= 80) return "high";
+  return "custom";
+}
+
+void publish_sensitivity_state() {
+  if (!client.connected()) return;
+  client.publish(mqtt_stallthreshold_state_topic.c_str(), sensitivity_name(stall_threshold), true);
+}
+
+void apply_sensitivity(uint8_t value, const char* label) {
+  set_stall_threshold(value);
+  log_msg(LOG_INFO, "NVS", "Sensitivity set to %s (threshold=%d)", label, stall_threshold);
+  publish_sensitivity_state();
+}
+
+void cmd_sensitivity(const String& param) {
+  String p = param;
+  p.trim();
+  p.toLowerCase();
+
+  if (p == "low") {
+    apply_sensitivity(15, "low");
+  } else if (p == "medium" || p == "med") {
+    apply_sensitivity(30, "medium");
+  } else if (p == "high") {
+    apply_sensitivity(60, "high");
+  } else if (p.startsWith("custom ")) {
+    int value = p.substring(7).toInt();
+    if (value >= 0 && value <= 255) {
+      apply_sensitivity(value, "custom");
+    } else {
+      log_msg(LOG_ERROR, "CMD", "sensitivity custom: must be 0-255 (got %d)", value);
+    }
+  } else if (p.length() == 0) {
+    // No argument — show current
+    output("Sensitivity: %s (threshold=%d, stalls when load drops below %d)\n",
+           sensitivity_name(stall_threshold), stall_threshold, stall_threshold * 2);
   } else {
-    String msg = "[ERROR] Threshold must be 0-255";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "sensitivity: use low, medium, high, or custom <0-255>");
   }
 }
 
 void cmd_calibrate(const String& param) {
-  Serial.println(F("Starting sensorless calibration..."));
-  ws_println(F("Starting sensorless calibration..."));
-  Serial.println(F("Ensure curtains can move freely!"));
-  ws_println(F("Ensure curtains can move freely!"));
+  log_msg(LOG_INFO, "CMD", "calibrate — ensure curtains can move freely");
   start_calibration();
 }
 
-void cmd_steps(const String& param) {
+void cmd_travelsteps(const String& param) {
   int value = param.toInt();
   if (value > 0 && value <= 500000) {
     steps_per_revolution = value;
     preferences.putInt("steps_per_rev", steps_per_revolution);
-    Serial.printf("Steps/rev: %d\n", steps_per_revolution);
-    ws_printf("Steps/rev: %d\n", steps_per_revolution);
+    log_msg(LOG_INFO, "NVS", "Total travel steps set to %d", steps_per_revolution);
   } else {
-    String msg = "[ERROR] Steps must be 1-500000";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "travelsteps: must be 1-500000 (got %d)", value);
   }
 }
 
@@ -875,11 +1169,9 @@ void cmd_setposition(const String& param) {
     current_position = value;
     save_position();
     publish_position();
-    Serial.printf("Position reset to %d\n", current_position);
-    ws_printf("Position reset to %d\n", current_position);
+    log_msg(LOG_INFO, "NVS", "Position reset to %d", current_position);
   } else {
-    Serial.printf("[ERROR] Position must be 0-%d\n", steps_per_revolution);
-    ws_printf("[ERROR] Position must be 0-%d\n", steps_per_revolution);
+    log_msg(LOG_ERROR, "CMD", "setposition: must be 0-%d (got %d)", steps_per_revolution, value);
   }
 }
 
@@ -888,220 +1180,157 @@ void cmd_sleep(const String& param) {
   if (value >= 0 && value <= 300000) {
     motor_sleep_timeout = value;
     preferences.putULong("sleep_timeout", motor_sleep_timeout);
-    Serial.printf("Sleep timeout: %lu ms\n", motor_sleep_timeout);
-    ws_printf("Sleep timeout: %lu ms\n", motor_sleep_timeout);
+    log_msg(LOG_INFO, "NVS", "Sleep timeout set to %lu ms", motor_sleep_timeout);
   } else {
-    String msg = "[ERROR] Sleep must be 0-300000 ms";
-    Serial.println(msg);
-    ws_println(msg);
+    log_msg(LOG_ERROR, "CMD", "sleep: must be 0-300000 ms (got %d)", value);
   }
 }
 
 void cmd_hadiscovery(const String& param) {
+  log_msg(LOG_INFO, "CMD", "hadiscovery — forcing republish");
   preferences.putBool("ha_disc_done", false);
   publish_ha_discovery(true);
-  String msg = "HA discovery republished";
-  Serial.println(msg);
-  ws_println(msg);
 }
 
 void cmd_config(const String& param) {
   String mqtt_topic = preferences.getString("mqtt_root_topic", "home/room/curtains");
 
-  String output = "\n=== Configuration ===\n";
-  output += "Hostname: " + device_hostname + "\n";
-  output += "IP: " + WiFi.localIP().toString() + "\n";
-  output += "SSID: " + WiFi.SSID() + "\n";
-  output += "RSSI: " + String(WiFi.RSSI()) + " dBm\n";
-  output += "MAC: " + WiFi.macAddress() + "\n";
-  output += "MQTT: " + mqtt_server + ":" + String(mqtt_port) + "\n";
-  output += "MQTT User: " + (mqtt_user.length() > 0 ? mqtt_user : "(none)") + "\n";
-  output += "MQTT Topic: " + mqtt_topic + "\n";
-  output += "Speed: " + String(step_delay_us) + " us/step\n";
-  output += "Microsteps: " + String(motor_microsteps) + "\n";
-  output += "Current: " + String(motor_current_ma) + " mA\n";
-  output += "Stall threshold: " + String(stall_threshold) + "\n";
-  output += "Steps/Rev: " + String(steps_per_revolution) + "\n";
-  output += "Sleep Timeout: " + String(motor_sleep_timeout) + " ms\n";
-  output += "TMC2209: " + String(tmc_available ? "OK" : "NOT CONNECTED") + "\n";
-  output += "Setup: http://" + WiFi.localIP().toString() + "/setup\n";
-  output += "====================\n";
-
-  Serial.print(output);
-  ws_print(output);
+  output("\n=== Configuration ===\n");
+  output("Hostname: %s\n", device_hostname.c_str());
+  output("IP: %s\n", WiFi.localIP().toString().c_str());
+  output("SSID: %s\n", WiFi.SSID().c_str());
+  output("RSSI: %d dBm\n", WiFi.RSSI());
+  output("MAC: %s\n", WiFi.macAddress().c_str());
+  output("MQTT: %s:%d\n", mqtt_server.c_str(), mqtt_port);
+  output("MQTT User: %s\n", mqtt_user.length() > 0 ? mqtt_user.c_str() : "(none)");
+  output("MQTT Topic: %s\n", mqtt_topic.c_str());
+  output("Speed: %d us/step (lower=faster)\n", step_delay_us);
+  output("Microsteps: %d\n", motor_microsteps);
+  output("Current: %d mA\n", motor_current_ma);
+  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
+  output("Travel Steps: %d\n", steps_per_revolution);
+  output("Sleep Timeout: %lu ms\n", motor_sleep_timeout);
+  output("TMC2209: %s\n", tmc_available ? "OK" : "NOT CONNECTED");
+  output("Log level: %s\n", log_level_name(current_log_level));
+  output("Setup: http://%s/setup\n", WiFi.localIP().toString().c_str());
+  output("====================\n");
 }
 
 void cmd_restart(const String& param) {
-  String msg = "Restarting...";
-  Serial.println(msg);
-  ws_println(msg);
+  log_msg(LOG_INFO, "SYS", "Restarting by command...");
   delay(1000);
   ESP.restart();
 }
 
 void cmd_help(const String& param) {
-  String help = "\n=== Commands ===\n";
-  help += "open          - Open curtain\n";
-  help += "close         - Close curtain\n";
-  help += "stop          - Stop movement\n";
-  help += "position <n>  - Move to step position\n";
-  help += "speed <us>    - Set step delay (100-10000)\n";
-  help += "steps <n>     - Set steps per revolution\n";
-  help += "setposition <n> - Reset position counter\n";
-  help += "sleep <ms>    - Set sleep timeout\n";
-  help += "\n-- TMC2209 --\n";
-  help += "microsteps <n> - Set microsteps (1-256)\n";
-  help += "current <mA>  - Set motor current (100-2000)\n";
-  help += "stallthreshold <n> - Stall sensitivity (0-255)\n";
-  help += "calibrate     - Auto-calibrate using stallguard\n";
-  help += "verbose       - Toggle SG output during movement\n";
-  help += "sgtest [sec]  - Monitor SG values (default 5s)\n";
-  help += "\n-- System --\n";
-  help += "status        - Show current status\n";
-  help += "config        - Show configuration\n";
-  help += "hadiscovery   - Republish HA discovery\n";
-  help += "restart       - Reboot device\n";
-  help += "================\n";
-
-  Serial.print(help);
-  ws_print(help);
+  output("\n=== Movement ===\n");
+  output("open              Open curtain\n");
+  output("close             Close curtain\n");
+  output("stop              Stop movement / cancel calibrate\n");
+  output("<0-100>           Move to percentage\n");
+  output("\n=== Settings ===\n");
+  output("speed <us>        Step delay (100-10000, lower=faster)\n");
+  output("current <mA>      Motor current (100-2000)\n");
+  output("microsteps <n>    Microsteps (1,2,4,8,16,32,64,128,256)\n");
+  output("sensitivity <lvl> Stall sensitivity (low|medium|high|custom N)\n");
+  output("sleep <ms>        Motor sleep timeout (0=never)\n");
+  output("travelsteps <n>   Total travel range in steps\n");
+  output("\n=== Calibration ===\n");
+  output("calibrate         Find curtain travel range automatically\n");
+  output("motortest [sec]   Test motor and check sensitivity (default 5s)\n");
+  output("\n=== Diagnostics ===\n");
+  output("status            Position, motor, MQTT, TMC status\n");
+  output("config            Full configuration dump\n");
+  output("verbose           Toggle SG debug during movement\n");
+  output("loglevel <level>  Set log level (error|warn|info|debug)\n");
+  output("ledon / ledoff    Manual LED control\n");
+  output("\n=== System ===\n");
+  output("setposition <n>   Override position counter (use with care)\n");
+  output("hadiscovery       Republish HA discovery\n");
+  output("restart           Reboot device\n");
 }
 
 void cmd_status(const String& param) {
-  String output = "\n=== Status ===\n";
-  output += "Position: " + String(current_position) + " (" + String((current_position * 100) / steps_per_revolution) + "%)\n";
-  output += "Moving: " + String(is_moving ? "Yes" : "No") + "\n";
+  output("\n=== Status ===\n");
+  output("Position: %d (%d%%)\n", current_position,
+         (current_position * 100) / steps_per_revolution);
+  output("Moving: %s\n", is_moving ? "Yes" : "No");
   if (is_moving) {
-    output += "Target: " + String(target_position) + "\n";
+    output("Target: %d\n", target_position);
   }
-  output += "Motor: " + String(motor_enabled ? "Enabled" : "Disabled") + "\n";
-  output += "MQTT: " + String(client.connected() ? "Connected" : "Disconnected") + "\n";
+  output("Motor: %s\n", motor_enabled ? "Enabled" : "Disabled");
+  output("MQTT: %s\n", client.connected() ? "Connected" : "Disconnected");
 
   // TMC2209 live status
   if (tmc_available) {
     uint32_t drv_status = driver.DRV_STATUS();
     uint16_t sg = driver.SG_RESULT();
-    output += "-- TMC2209 --\n";
-    output += "SG_RESULT: " + String(sg) + "\n";
-    output += "Current scale: " + String((drv_status >> 16) & 0x1F) + "/31\n";
-    output += "Standstill: " + String((drv_status >> 31) & 1 ? "Yes" : "No") + "\n";
-    output += "OT warning: " + String((drv_status >> 0) & 1 ? "Yes" : "No") + "\n";
-    output += "DIAG pin: " + String(digitalRead(DIAG_PIN) ? "HIGH" : "LOW") + "\n";
+    output("-- TMC2209 --\n");
+    output("SG_RESULT: %d\n", sg);
+    output("Current scale: %d/31\n", (drv_status >> 16) & 0x1F);
+    output("Standstill: %s\n", (drv_status >> 31) & 1 ? "Yes" : "No");
+    output("OT warning: %s\n", (drv_status >> 0) & 1 ? "Yes" : "No");
+    output("DIAG pin: %s\n", digitalRead(DIAG_PIN) ? "HIGH" : "LOW");
   } else {
-    output += "TMC2209: NOT CONNECTED\n";
+    output("TMC2209: NOT CONNECTED\n");
   }
 
-  output += "-- System --\n";
-  output += "Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
-  output += "Uptime: " + String(millis() / 1000) + "s\n";
-  output += "==============\n";
-
-  Serial.print(output);
-  ws_print(output);
-}
-
-void cmd_tmcstatus(const String& param) {
-  if (!tmc_available) {
-    String msg = "TMC2209 not available";
-    Serial.println(msg);
-    ws_println(msg);
-    return;
-  }
-
-  uint32_t drv_status = driver.DRV_STATUS();
-  uint16_t sg = driver.SG_RESULT();
-  uint32_t ioin = driver.IOIN();
-
-  String output = "\n=== TMC2209 Status ===\n";
-  output += "Connection: " + String(driver.test_connection() == 0 ? "OK" : "ERROR") + "\n";
-  output += "IOIN: 0x" + String(ioin, HEX) + "\n";
-  output += "DRV_STATUS: 0x" + String(drv_status, HEX) + "\n";
-  output += "SG_RESULT: " + String(sg) + "\n";
-  output += "Stall threshold: " + String(stall_threshold) + "\n";
-  output += "DIAG pin: " + String(digitalRead(DIAG_PIN) ? "HIGH" : "LOW") + "\n";
-  output += "Standstill: " + String((drv_status >> 31) & 1 ? "Yes" : "No") + "\n";
-  output += "OT warning: " + String((drv_status >> 0) & 1 ? "Yes" : "No") + "\n";
-  output += "Current scale: " + String((drv_status >> 16) & 0x1F) + "/31\n";
-  output += "======================\n";
-
-  Serial.print(output);
-  ws_print(output);
+  output("-- System --\n");
+  output("Heap: %u bytes\n", ESP.getFreeHeap());
+  unsigned long uptime = millis() / 1000;
+  output("Uptime: %lud %luh %lum %lus\n", uptime / 86400, (uptime % 86400) / 3600, (uptime % 3600) / 60, uptime % 60);
+  output("Last reset: %s\n", last_reset_reason);
+  output("Log level: %s\n", log_level_name(current_log_level));
+  output("==============\n");
 }
 
 void cmd_verbose(const String& param) {
   tmc_verbose = !tmc_verbose;
-  String msg = "Verbose mode: " + String(tmc_verbose ? "ON" : "OFF");
-  Serial.println(msg);
-  ws_println(msg);
+  log_msg(LOG_INFO, "TMC", "Verbose mode %s", tmc_verbose ? "ON" : "OFF");
   if (tmc_verbose) {
-    Serial.println(F("SG values will show during movement (every 500ms)"));
-    ws_println(F("SG values will show during movement (every 500ms)"));
-    Serial.println(F("SG = StallGuard load value (0-1023)"));
-    ws_println(F("SG = StallGuard load value (0-1023)"));
-    Serial.println(F("When SG < SGTHRS*2, stall is detected"));
-    ws_println(F("When SG < SGTHRS*2, stall is detected"));
+    log_msg(LOG_INFO, "TMC", "Motor load readings will appear during movement (set loglevel debug)");
   }
 }
 
-void cmd_sgtest(const String& param) {
+void cmd_motortest(const String& param) {
   if (!tmc_available) {
-    ws_println(F("TMC2209 not available"));
+    output("TMC2209 not available\n");
     return;
   }
 
-  // Parse duration (default 5 seconds)
   int duration = param.length() > 0 ? param.toInt() : 5;
   duration = constrain(duration, 1, 60);
 
-  // Use actual motor speed settings for realistic test
   unsigned long test_step_delay = step_delay_us;
+  int steps_between_reads = constrain(motor_microsteps, 4, 32);
 
-  // Calculate full steps per SG update (SG updates once per full step = microsteps steps)
-  // We'll read SG every N steps to get fresh values without blocking too much
-  int steps_between_reads = motor_microsteps;  // Read once per full step
-  if (steps_between_reads < 4) steps_between_reads = 4;
-  if (steps_between_reads > 32) steps_between_reads = 32;
-
-  ws_println(F("\n========== StallGuard Test =========="));
-  ws_printf("Duration: %d seconds\n", duration);
-  ws_printf("Step delay: %lu us (your speed setting)\n", test_step_delay);
-  ws_printf("Microsteps: %d\n", motor_microsteps);
-  ws_printf("Current: %d mA\n", motor_current_ma);
-  ws_printf("Current threshold: %d (stall when SG < %d)\n", stall_threshold, stall_threshold * 2);
-  ws_println(F(""));
-  ws_println(F(">> Apply resistance to shaft to see SG drop <<"));
-  ws_println(F(">> SG updates once per FULL motor step <<"));
-  ws_println(F("==========================================\n"));
+  output("\n=== Motor Test ===\n");
+  output("Duration: %d seconds\n", duration);
+  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
+  output("Apply resistance to the shaft to test stall detection.\n\n");
 
   wake_motor();
   digitalWrite(DIR_PIN, HIGH);
   delayMicroseconds(100);
-
-  // Clear stall flag
   stall_flag = false;
 
-  // --- RAMP-UP PHASE (500ms) ---
-  // Start slower and accelerate to target speed for stable readings
-  ws_println(F("Ramping up to speed..."));
+  // Ramp up (500ms)
+  output("Ramping up...\n");
   unsigned long ramp_start = millis();
   unsigned long last_step = micros();
-  unsigned long current_delay = test_step_delay * 3;  // Start at 1/3 speed
-
+  unsigned long current_delay = test_step_delay * 3;
   unsigned long last_yield = millis();
+
   while (millis() - ramp_start < 500) {
     unsigned long now = micros();
     if (now - last_step >= current_delay) {
       step_motor();
       last_step = now;
-
-      // Gradually speed up
       if (current_delay > test_step_delay) {
         current_delay -= 2;
         if (current_delay < test_step_delay) current_delay = test_step_delay;
       }
     }
-
-    // Yield every 50ms to keep WiFi alive
     if (millis() - last_yield >= 50) {
       yield();
       esp_task_wdt_reset();
@@ -1109,162 +1338,138 @@ void cmd_sgtest(const String& param) {
     }
   }
 
-  ws_println(F("At speed - measuring...\n"));
+  output("Running...\n\n");
 
-  // --- MAIN MEASUREMENT PHASE ---
+  // Measurement phase
   unsigned long test_start = millis();
   uint16_t min_sg = 1023, max_sg = 0;
-  uint32_t sg_sum = 0;
-  uint32_t sg_count = 0;
-  int step_count = 0;
+  uint32_t sg_sum = 0, sg_count = 0;
+  int step_count = 0, stall_events = 0;
   unsigned long last_report = 0;
-  const unsigned long REPORT_INTERVAL_MS = 250;  // Report 4x per second
-
-  // For tracking recent values (simple moving average)
   uint16_t recent_sg[8] = {0};
   int recent_idx = 0;
-
-  // Stall event counter
-  int stall_events = 0;
 
   while (millis() - test_start < (unsigned long)(duration * 1000)) {
     unsigned long now = micros();
 
-    // Step at configured rate - this is the CRITICAL part
-    // Motor MUST keep stepping for valid SG readings
     if (now - last_step >= test_step_delay) {
       step_motor();
       last_step = now;
       step_count++;
 
-      // Read SG after enough steps for it to have updated
-      // SG_RESULT updates once per full step (= microsteps worth of step pulses)
       if (step_count >= steps_between_reads) {
         step_count = 0;
-
-        // Quick UART read between steps
         uint16_t sg = driver.SG_RESULT();
 
-        // Update statistics
         if (sg < min_sg) min_sg = sg;
         if (sg > max_sg) max_sg = sg;
         sg_sum += sg;
         sg_count++;
 
-        // Track recent values for moving average
         recent_sg[recent_idx] = sg;
         recent_idx = (recent_idx + 1) % 8;
 
-        // Check for stall events
         if (sg < (uint16_t)(stall_threshold * 2)) {
           stall_events++;
         }
       }
     }
 
-    // Periodic reporting (non-blocking)
     unsigned long now_ms = millis();
-    if (now_ms - last_report >= REPORT_INTERVAL_MS) {
+    if (now_ms - last_report >= 500) {
       last_report = now_ms;
 
-      // Calculate moving average from recent samples
       uint32_t recent_sum = 0;
       for (int i = 0; i < 8; i++) recent_sum += recent_sg[i];
-      uint16_t recent_avg = recent_sum / 8;
+      uint16_t avg = recent_sum / 8;
+      uint16_t latest = recent_sg[(recent_idx + 7) % 8];
 
-      // Get current DIAG state
-      bool diag = digitalRead(DIAG_PIN);
+      // Visual load bar: map SG to 0-16 blocks (higher SG = more blocks = lighter load)
+      int blocks = (avg > 0) ? constrain(avg / 40, 0, 16) : 0;
+      char bar[17];
+      for (int i = 0; i < 16; i++) bar[i] = (i < blocks) ? '#' : '.';
+      bar[16] = 0;
 
-      // Output - keep it compact for readability
-      Serial.printf("SG:%4d  recent:%4d  [%4d-%4d]  DIAG:%d  stalls:%d\n",
-                    recent_sg[(recent_idx + 7) % 8],  // Most recent
-                    recent_avg, min_sg, max_sg, diag, stall_events);
-      ws_printf("SG:%4d avg:%4d [%d-%d] stalls:%d\n",
-                recent_sg[(recent_idx + 7) % 8], recent_avg, min_sg, max_sg, stall_events);
+      const char* load_label;
+      if (latest < (uint16_t)(stall_threshold * 2)) load_label = "STALL!";
+      else if (avg < 100) load_label = "Heavy";
+      else if (avg < 300) load_label = "Medium";
+      else load_label = "Light";
 
+      output("  Load: %-6s [%s] SG:%d\n", load_label, bar, latest);
       esp_task_wdt_reset();
     }
 
-    // Yield frequently to keep WebSocket alive (every ~50ms)
     static unsigned long last_loop_yield = 0;
-    if (now_ms - last_loop_yield >= 50) {
+    unsigned long now_ms2 = millis();
+    if (now_ms2 - last_loop_yield >= 50) {
       yield();
-      last_loop_yield = now_ms;
+      last_loop_yield = now_ms2;
     }
   }
 
   stop_motor();
 
-  // --- RESULTS SUMMARY ---
+  // Results
   uint16_t avg_sg = sg_count > 0 ? (sg_sum / sg_count) : 0;
-  uint16_t sg_range = max_sg - min_sg;
 
-  ws_println(F("\n============ RESULTS ============"));
-  ws_printf("Samples collected: %lu\n", sg_count);
-  ws_printf("SG range: %d to %d (span: %d)\n", min_sg, max_sg, sg_range);
-  ws_printf("Average SG: %d\n", avg_sg);
-  ws_printf("Stall events (SG < %d): %d\n", stall_threshold * 2, stall_events);
+  output("\n=== Results ===\n");
+  output("Average load: %s (SG avg: %d, range: %d-%d)\n",
+         avg_sg < 100 ? "Heavy" : avg_sg < 300 ? "Medium" : "Light",
+         avg_sg, min_sg, max_sg);
+  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
+  output("False stalls during test: %d\n", stall_events);
 
-  ws_println(F("\n------ Threshold Recommendations ------"));
-  ws_println(F("(Higher threshold = MORE sensitive to stalls)"));
-  ws_println(F("(Lower threshold = LESS sensitive to stalls)"));
-
-  // Calculate suggestions based on actual data
-  // The stall triggers when SG_RESULT < SGTHRS * 2
-  // So SGTHRS = (trigger_point) / 2
-
-  if (sg_count > 10 && min_sg > 10) {
-    // Conservative: Won't false-trigger during normal operation
-    // Set to half of minimum observed (with margin)
-    uint8_t conservative = (min_sg > 20) ? ((min_sg - 10) / 2) : 1;
-
-    // Moderate: Good balance, set at 1/3 of average
-    uint8_t moderate = avg_sg / 6;
-
-    // Sensitive: Will catch lighter stalls, may have some false triggers
-    // Set based on span - closer to normal operating point
-    uint8_t sensitive = avg_sg / 4;
-
-    ws_printf("\nConservative: %3d  (stalls when SG < %d)\n", conservative, conservative * 2);
-    ws_printf("Moderate:     %3d  (stalls when SG < %d)\n", moderate, moderate * 2);
-    ws_printf("Sensitive:    %3d  (stalls when SG < %d)\n", sensitive, sensitive * 2);
-
-    ws_printf("\nYour current: %3d  (stalls when SG < %d)\n", stall_threshold, stall_threshold * 2);
-
-    // Give specific advice
-    if (stall_events > 5) {
-      ws_println(F("\n! Many stall events detected during test"));
-      ws_println(F("! Consider LOWERING threshold or checking mechanics"));
-    } else if (stall_events == 0 && stall_threshold > sensitive) {
-      ws_println(F("\n* No stalls during test - threshold may be too high"));
-      ws_printf("* Try threshold around %d for calibration\n", moderate);
-    }
+  if (stall_events > 5) {
+    output("\nProblem: Too many false stalls detected.\n");
+    output("Try:  sensitivity low   (less sensitive, ignores light friction)\n");
+  } else if (stall_events > 0) {
+    output("\nSome false stalls detected. This might cause calibration issues.\n");
+    output("Try:  sensitivity low   if calibration stops too early\n");
   } else {
-    ws_println(F("\nInsufficient data for recommendations."));
-    ws_println(F("Try running longer or check TMC2209 connection."));
+    output("\nNo false stalls. Current sensitivity looks good for calibration.\n");
   }
 
-  ws_println(F("\nTip: Run test while manually resisting shaft"));
-  ws_println(F("     to see SG drop when load increases."));
-  ws_println(F("====================================="));
+  if (avg_sg < 50) {
+    output("\nWarning: Motor is under heavy load even when free.\n");
+    output("Check: Is something blocking the curtain?\n");
+    output("Try:   current %d   (increase motor power)\n", constrain(motor_current_ma + 200, 100, 2000));
+  }
+
+  output("===============\n");
+}
+
+void cmd_loglevel(const String& param) {
+  LogLevel new_level;
+  if (param == "error") {
+    new_level = LOG_ERROR;
+  } else if (param == "warn") {
+    new_level = LOG_WARN;
+  } else if (param == "info") {
+    new_level = LOG_INFO;
+  } else if (param == "debug") {
+    new_level = LOG_DEBUG;
+  } else {
+    log_msg(LOG_ERROR, "CMD", "loglevel: unknown level '%s' (use error|warn|info|debug)", param.c_str());
+    return;
+  }
+  current_log_level = new_level;
+  preferences.putUChar("log_level", (uint8_t)new_level);
+  log_msg(LOG_INFO, "NVS", "Log level set to %s", log_level_name(new_level));
 }
 
 void cmd_ledon(const String& param) {
   led_manual_control = true;
   led_desired_state = LOW;
   digitalWrite(STATUS_LED, led_desired_state);
-  String msg = "LED ON";
-  Serial.println(msg);
-  ws_println(msg);
+  log_msg(LOG_INFO, "CMD", "LED ON");
 }
 
 void cmd_ledoff(const String& param) {
   led_manual_control = true;
   led_desired_state = HIGH;
   digitalWrite(STATUS_LED, led_desired_state);
-  String msg = "LED OFF";
-  Serial.println(msg);
-  ws_println(msg);
+  log_msg(LOG_INFO, "CMD", "LED OFF");
 }
 
 struct Command {
@@ -1276,21 +1481,22 @@ const Command commands[] = {
   {"open", cmd_open},
   {"close", cmd_close},
   {"stop", cmd_stop},
-  {"position ", cmd_position},
   {"speed ", cmd_speed},
   {"microsteps ", cmd_microsteps},
   {"current ", cmd_current},
-  {"stallthreshold ", cmd_stallthreshold},
+  {"sensitivity ", cmd_sensitivity},
+  {"sensitivity", cmd_sensitivity},
   {"calibrate", cmd_calibrate},
-  {"steps ", cmd_steps},
+  {"travelsteps ", cmd_travelsteps},
   {"setposition ", cmd_setposition},
   {"sleep ", cmd_sleep},
   {"hadiscovery", cmd_hadiscovery},
   {"config", cmd_config},
   {"status", cmd_status},
   {"verbose", cmd_verbose},
-  {"sgtest ", cmd_sgtest},
-  {"sgtest", cmd_sgtest},
+  {"motortest ", cmd_motortest},
+  {"motortest", cmd_motortest},
+  {"loglevel ", cmd_loglevel},
   {"restart", cmd_restart},
   {"help", cmd_help},
   {"ledon", cmd_ledon},
@@ -1338,16 +1544,13 @@ void process_command(const String& cmd) {
     int percentage = command.toInt();
     if (percentage >= 0 && percentage <= 100) {
       int target_steps = (percentage * steps_per_revolution) / 100;
+      log_msg(LOG_INFO, "CMD", "HA position: %d%% -> step %d", percentage, target_steps);
       start_movement(target_steps);
-      Serial.printf("HA position: %d%% -> step %d\n", percentage, target_steps);
-      ws_printf("HA position: %d%% -> step %d\n", percentage, target_steps);
       return;
     }
   }
 
-  String msg = "[ERROR] Unknown: " + command;
-  Serial.println(msg);
-  ws_println(msg);
+  log_msg(LOG_ERROR, "CMD", "Unknown command: %s", command.c_str());
 }
 
 // ============================================================================
@@ -1424,7 +1627,7 @@ void setup_webserial() {
     html.replace("%MQTT_TOPIC%", preferences.getString("mqtt_root_topic", "home/room/curtains"));
     html.replace("%STEPS%", String(preferences.getInt("steps_per_rev", 2000)));
     html.replace("%CURRENT%", String(preferences.getUShort("current_ma", 800)));
-    html.replace("%MICROSTEPS%", String(preferences.getUShort("microsteps", 16)));
+    html.replace("%MICROSTEPS%", String(preferences.getUShort("microsteps", 2)));
     html.replace("%STALLTHRESHOLD%", String(preferences.getUChar("stall_thr", 50)));
     request->send(200, "text/html", html);
   });
@@ -1487,13 +1690,14 @@ void setup_webserial() {
     command.trim();
     if (command.length() == 0) return;
 
-    ws_println("> " + command);
+    output("> %s\n", command.c_str());
 
     ws_pending_command = command;
     ws_command_pending = true;
   });
 
   WebSerial.begin(&server);
+  WebSerial.setBuffer(256);
   server.begin();
 }
 
@@ -1547,25 +1751,24 @@ void start_config_portal() {
   wm.addParameter(&p_ota);
   wm.addParameter(&p_steps);
 
-  Serial.println("Starting AP: CurtainSetup");
+  log_msg(LOG_INFO, "WIFI", "Starting config portal AP: CurtainSetup");
   if (!wm.autoConnect("CurtainSetup", "12345678")) {
-    Serial.println("Config portal timeout, restarting...");
+    log_msg(LOG_ERROR, "WIFI", "Config portal timeout, restarting...");
     delay(1000);
     ESP.restart();
   }
-  Serial.println("WiFi connected via portal");
+  log_msg(LOG_INFO, "WIFI", "WiFi connected via config portal");
 
   if (shouldSave) {
     preferences.putString("hostname", p_hostname.getValue());
     preferences.putString("mqtt_server", p_server.getValue());
-    preferences.putInt("mqtt_port", String(p_port.getValue()).toInt());
+    preferences.putInt("mqtt_port", atoi(p_port.getValue()));
     preferences.putString("mqtt_user", p_user.getValue());
     preferences.putString("mqtt_pass", p_pass.getValue());
     preferences.putString("mqtt_root_topic", p_topic.getValue());
-    int steps_val = String(p_steps.getValue()).toInt();
+    int steps_val = atoi(p_steps.getValue());
     if (steps_val > 0) preferences.putInt("steps_per_rev", steps_val);
-    String ota_new = String(p_ota.getValue());
-    if (ota_new.length() > 0) preferences.putString("ota_pass", ota_new);
+    if (strlen(p_ota.getValue()) > 0) preferences.putString("ota_pass", p_ota.getValue());
     preferences.putBool("ha_disc_done", false);
     delay(1000);
     ESP.restart();
@@ -1579,7 +1782,7 @@ void setup_wifi_manager() {
   mqtt_user = preferences.getString("mqtt_user", "your_mqtt_user");
   mqtt_password = preferences.getString("mqtt_pass", "your_mqtt_password");
 
-  Serial.println("Starting WiFi...");
+  log_msg(LOG_INFO, "WIFI", "Starting WiFi...");
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(device_hostname.c_str());
@@ -1589,13 +1792,13 @@ void setup_wifi_manager() {
 
   if (force_portal || !has_wifi_config) {
     if (force_portal) {
-      Serial.println("Button held - starting config portal");
+      log_msg(LOG_INFO, "BTN", "Button held at boot — starting config portal");
     } else {
-      Serial.println("No WiFi config - starting config portal");
+      log_msg(LOG_INFO, "WIFI", "No WiFi config saved — starting config portal");
     }
     start_config_portal();
   } else {
-    Serial.println("Connecting to saved WiFi...");
+    log_msg(LOG_INFO, "WIFI", "Connecting to saved WiFi...");
     WiFi.begin();
 
     int attempts = 0;
@@ -1607,7 +1810,8 @@ void setup_wifi_manager() {
       digitalWrite(STATUS_LED, (attempts % 2) ? LOW : HIGH);
 
       if (attempts >= 60) {
-        Serial.println("\nRetrying WiFi connection...");
+        Serial.println();
+        log_msg(LOG_WARN, "WIFI", "Retrying WiFi connection...");
         WiFi.disconnect();
         delay(1000);
         WiFi.begin();
@@ -1615,7 +1819,15 @@ void setup_wifi_manager() {
       }
     }
     digitalWrite(STATUS_LED, HIGH);
-    Serial.println("\nWiFi connected");
+    Serial.println();
+    log_msg(LOG_INFO, "WIFI", "WiFi connected: %s", WiFi.localIP().toString().c_str());
+  }
+
+  // Set DHCP hostname so router shows correct device name
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (netif) {
+    esp_netif_set_hostname(netif, device_hostname.c_str());
+    log_msg(LOG_INFO, "WIFI", "DHCP hostname set to: %s", device_hostname.c_str());
   }
 
   wifi_state = WIFI_CONNECTED;
@@ -1630,6 +1842,7 @@ void handle_wifi_reconnection() {
       break;
 
     case WIFI_DISCONNECTED:
+      log_msg(LOG_WARN, "WIFI", "Disconnected — attempting reconnection");
       WiFi.disconnect();
       WiFi.setHostname(device_hostname.c_str());
       WiFi.begin();
@@ -1639,10 +1852,14 @@ void handle_wifi_reconnection() {
 
     case WIFI_RECONNECTING:
       if (WiFi.status() == WL_CONNECTED) {
+        log_msg(LOG_INFO, "WIFI", "Reconnected: %s", WiFi.localIP().toString().c_str());
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) esp_netif_set_hostname(netif, device_hostname.c_str());
         wifi_state = WIFI_CONNECTED;
         MDNS.end();
         setup_mdns();
       } else if (millis() - wifi_reconnect_start > WIFI_RECONNECT_TIMEOUT) {
+        log_msg(LOG_ERROR, "WIFI", "Reconnect timeout after %lums — restarting", WIFI_RECONNECT_TIMEOUT);
         ESP.restart();
       }
       break;
@@ -1669,6 +1886,7 @@ void setup_ota() {
   }
 
   ArduinoOTA.onStart([]() {
+    log_msg(LOG_INFO, "OTA", "OTA update starting — stopping motor and disconnecting");
     if (is_moving) stop_movement("OTA");
     if (cal_state != CAL_IDLE) {
       cal_state = CAL_IDLE;
@@ -1726,7 +1944,7 @@ void check_reset_button() {
       unsigned long hold_time = millis() - button_press_start;
 
       if (hold_time >= AP_HOLD_MIN && hold_time < AP_HOLD_MAX) {
-        Serial.println("Starting config portal...");
+        log_msg(LOG_INFO, "BTN", "Config portal triggered by button hold (%lums)", hold_time);
         if (client.connected()) client.disconnect();
 
         WiFi.disconnect(true, true);
@@ -1745,7 +1963,7 @@ void check_reset_button() {
       }
 
       if (hold_time >= RESET_HOLD_MIN && hold_time < RESET_HOLD_MAX) {
-        Serial.println("Factory reset...");
+        log_msg(LOG_INFO, "BTN", "Factory reset triggered by button hold (%lums)", hold_time);
         if (client.connected()) client.disconnect();
         WiFi.disconnect(true);
 
@@ -1776,14 +1994,35 @@ void setup() {
 
   Serial.println("\n=== Curtain Controller v5.2 (TMC2209) ===");
 
+  // Log reset reason before anything else
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char* reason_str;
+  switch (reason) {
+    case ESP_RST_POWERON:  reason_str = "Power-on"; break;
+    case ESP_RST_SW:       reason_str = "Software restart"; break;
+    case ESP_RST_PANIC:    reason_str = "Crash (panic)"; break;
+    case ESP_RST_INT_WDT:  reason_str = "Interrupt watchdog"; break;
+    case ESP_RST_TASK_WDT: reason_str = "Task watchdog"; break;
+    case ESP_RST_WDT:      reason_str = "Other watchdog"; break;
+    case ESP_RST_BROWNOUT: reason_str = "Brownout"; break;
+    default:               reason_str = "Unknown"; break;
+  }
+  last_reset_reason = reason_str;
+  Serial.printf("Reset reason: %s\n", reason_str);
+
   preferences.begin("curtains", false);
 
+  // Load log level before any log_msg calls
+  current_log_level = (LogLevel)preferences.getUChar("log_level", (uint8_t)LOG_INFO);
+
+  log_msg(LOG_INFO, "BOOT", "Reset reason: %s", reason_str);
+
   current_position = preferences.getInt("position", 0);
-  step_delay_us = preferences.getInt("step_delay", 800);
+  step_delay_us = preferences.getInt("step_delay", 2000);
   motor_sleep_timeout = preferences.getULong("sleep_timeout", 30000);
   steps_per_revolution = preferences.getInt("steps_per_rev", 2000);
   motor_current_ma = preferences.getUShort("current_ma", 800);
-  motor_microsteps = preferences.getUShort("microsteps", 16);
+  motor_microsteps = preferences.getUShort("microsteps", 2);
   stall_threshold = preferences.getUChar("stall_thr", 50);
 
   pinMode(STATUS_LED, OUTPUT);
@@ -1805,11 +2044,12 @@ void setup() {
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
 
-  Serial.println("Ready!");
-  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("WebSerial: http://%s/webserial\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Setup: http://%s/setup\n", WiFi.localIP().toString().c_str());
-  Serial.printf("TMC2209: %s\n", tmc_available ? "OK" : "NOT CONNECTED");
+  log_msg(LOG_INFO, "BOOT", "Ready! IP:%s TMC2209:%s LogLevel:%s",
+          WiFi.localIP().toString().c_str(),
+          tmc_available ? "OK" : "NOT CONNECTED",
+          log_level_name(current_log_level));
+  log_msg(LOG_INFO, "BOOT", "WebSerial: http://%s/webserial", WiFi.localIP().toString().c_str());
+  log_msg(LOG_INFO, "BOOT", "Setup: http://%s/setup", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
