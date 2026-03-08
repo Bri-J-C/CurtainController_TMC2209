@@ -2168,7 +2168,7 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  Serial.println("\n=== Curtain Controller v5.2 (TMC2209) ===");
+  Serial.printf("\n=== Curtain Controller v%s (TMC2209) ===\n", FW_VERSION);
 
   // Log reset reason before anything else
   esp_reset_reason_t reason = esp_reset_reason();

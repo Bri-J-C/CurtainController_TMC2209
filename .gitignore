@@ -1,0 +1,41 @@
+# Compiled binaries and Arduino build output
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Preview / test HTML files
+preview.html
+icon_preview.html
+
+# Screenshots and images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+
+# Claude context directory
+.claude/
+
+# Sensitive files
+.env
+.env.*
+credentials*
+secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Arduino IDE temporaries
+*.bak
+
+# macOS metadata
+.DS_Store
+__MACOSX/
+
+# Windows metadata
+Thumbs.db
+desktop.ini

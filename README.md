@@ -2,7 +2,7 @@
 
 ESP32-C3 based smart curtain controller with TMC2209 stepper driver, UART control, StallGuard4 sensorless homing, and Home Assistant integration via MQTT.
 
-**Firmware version: v5.2**
+**Firmware version: v5.3**
 
 ---
 
@@ -46,12 +46,13 @@ Single-wire half-duplex UART: both RX and TX share the PDN_UART pin. The 1K resi
 
 - **Silent operation** via TMC2209 StealthChop (spread-spectrum PWM)
 - **Sensorless homing** using StallGuard4 — no end-stop switches required
-- **Auto-calibration** — finds the full travel range automatically and stores it
+- **Auto-calibration** — finds the full travel range automatically and stores it; back-off margins set precise, repeatable endpoints
+- **Direction invert** — swap open/close direction via WebSerial command, MQTT switch entity, or setup page; persisted to NVS
 - **UART motor control** — current, microsteps, and stall threshold configurable at runtime without recompiling
-- **Home Assistant auto-discovery** — cover entity plus number/select entities for all tunable parameters
-- **MQTT control** — open, close, stop, position (0-100%), and settings topics
+- **Home Assistant auto-discovery** — cover entity plus number/select/switch entities for all tunable parameters
+- **MQTT control** — open, close, stop, position (0–100%), and settings topics
 - **WebSerial console** at `/webserial` — full command interface over browser
-- **Web setup page** at `/setup` — configure WiFi, MQTT, hostname, and motor parameters without reflashing
+- **Web setup page** at `/setup` — dark theme UI; configure WiFi, MQTT, hostname, and motor parameters without reflashing; root `/` redirects here automatically
 - **WiFiManager** — captive portal on first boot or button hold for WiFi provisioning
 - **OTA updates** — ArduinoOTA over port 3232
 - **Motor auto-sleep** — driver disabled after configurable inactivity timeout
@@ -59,6 +60,8 @@ Single-wire half-duplex UART: both RX and TX share the PDN_UART pin. The 1K resi
 - **Structured logging** — four log levels (ERROR/WARN/INFO/DEBUG) with subsystem tags
 - **WiFi reconnection** — automatic reconnect with restart fallback after 30s timeout
 - **TMC2209 error monitoring** — overtemperature and short-circuit detection with automatic driver reset
+- **Bulk WebSocket output** — `ws_send_bulk()` sends full status/config/help blocks as a single WebSocket message for instant display
+- **Single-source version** — `#define FW_VERSION` propagates the version string to HA discovery and the setup page footer
 
 ---
 
@@ -113,7 +116,7 @@ Select board: **ESP32C3 Dev Module** (or Nologo ESP32-C3 Super Mini if available
 3. **Connect to the AP** named `CurtainSetup` (password: `12345678`).
 4. **Fill in the captive portal form** with your WiFi credentials, MQTT server IP, MQTT port, username, password, and MQTT root topic. The default root topic is `home/room/curtains`.
 5. **Save** — the device connects to your network and restarts.
-6. **Open the setup page** at `http://<device-ip>/setup` to refine motor settings (current, microsteps, stall threshold).
+6. **Open the setup page** at `http://<device-ip>/setup` (or just `http://<device-ip>/` — the root redirects there) to refine motor settings (current, microsteps, stall sensitivity).
 7. **Run calibration** via WebSerial or MQTT to detect the curtain travel range automatically.
 
 ---
@@ -135,10 +138,11 @@ Holding at boot for 3+ seconds also forces the config portal to open immediately
 
 | URL | Purpose |
 |-----|---------|
-| `http://<device-ip>/setup` | Configure hostname, MQTT, and motor parameters. Saves to NVS and reboots. |
+| `http://<device-ip>/` | Redirects to `/setup` |
+| `http://<device-ip>/setup` | Configure hostname, MQTT, and motor parameters. Dropdowns for microsteps and stall sensitivity. Saves to NVS and reboots. Console button links to WebSerial. |
 | `http://<device-ip>/webserial` | Browser-based serial console. Full command interface. |
 
-The device also registers via mDNS as `<hostname>.local` (HTTP and Arduino OTA services).
+The setup page uses a dark theme with cyan-purple gradient styling. The device also registers via mDNS as `<hostname>.local` (HTTP and Arduino OTA services).
 
 ---
 
@@ -162,7 +166,8 @@ Connect to `http://<device-ip>/webserial` or open a serial monitor at 115200 bau
 | `speed <us>` | Step delay in microseconds (100–10000; lower = faster). Default: 2000 |
 | `current <mA>` | RMS motor current (100–2000 mA). Default: 800 |
 | `microsteps <n>` | Microstep resolution (1, 2, 4, 8, 16, 32, 64, 128, 256). Default: 2 |
-| `sensitivity <level>` | Stall sensitivity: `low`, `medium`, `high`, or `custom <0-255>` |
+| `sensitivity <level>` | Stall sensitivity: `extra_low`, `low`, `medium`, `high`, `max`, or `custom <0-255>` |
+| `invert` | Toggle open/close direction (persisted to NVS) |
 | `sleep <ms>` | Motor idle timeout in ms before driver disables (0 = never). Default: 30000 |
 | `travelsteps <n>` | Override total travel range in steps (1–500000) |
 
@@ -209,10 +214,12 @@ All topics are derived from the configured MQTT root topic (default: `home/room/
 | `<root>/speed/state` | Publish | integer | Current step delay |
 | `<root>/current/set` | Subscribe | `100`–`2000` | Set motor current (mA) |
 | `<root>/current/state` | Publish | integer | Current motor current |
-| `<root>/stallthreshold/set` | Subscribe | `low` / `medium` / `high` | Set stall sensitivity |
-| `<root>/stallthreshold/state` | Publish | `low` / `medium` / `high` | Current stall sensitivity |
+| `<root>/stallthreshold/set` | Subscribe | `extra_low` / `low` / `medium` / `high` / `max` | Set stall sensitivity |
+| `<root>/stallthreshold/state` | Publish | sensitivity name | Current stall sensitivity |
 | `<root>/microsteps/set` | Subscribe | `1`–`256` | Set microstep resolution |
 | `<root>/microsteps/state` | Publish | integer | Current microstep setting |
+| `<root>/invert/set` | Subscribe | `ON` / `OFF` | Set direction inversion |
+| `<root>/invert/state` | Publish | `ON` / `OFF` | Current direction inversion state |
 
 All published topics use retained messages. Availability uses a MQTT LWT (Last Will and Testament) so Home Assistant marks the device offline immediately on disconnect.
 
@@ -230,8 +237,9 @@ The device publishes MQTT auto-discovery payloads on first connect (and on `hadi
 | Calibrate | `button` | Triggers sensorless calibration |
 | Speed | `number` (100–10000 us, step 100) | Step delay / motor speed |
 | Motor Current | `number` (100–2000 mA, step 100) | RMS current limit |
-| Stall Sensitivity | `select` (low / medium / high) | StallGuard sensitivity preset |
+| Stall Sensitivity | `select` (extra_low / low / medium / high / max) | StallGuard sensitivity preset |
 | Microsteps | `select` (1–256, powers of 2) | Microstep resolution |
+| Invert Direction | `switch` | Swap open/close direction |
 
 The cover entity uses `set_position_topic` pointing to the command topic, so HA position slider commands send a bare percentage number directly.
 
@@ -243,18 +251,22 @@ StallGuard4 reports a motor load value (`SG_RESULT`, 0–1023). A stall is detec
 
 | Preset | SGTHRS | Stall triggers when SG < |
 |--------|--------|--------------------------|
+| `extra_low` | 5 | 10 |
 | `low` | 15 | 30 |
 | `medium` | 30 | 60 |
 | `high` | 60 | 120 |
+| `max` | 100 | 200 |
 
 Higher sensitivity catches lighter stalls (useful for lightweight curtains or lower current settings). Lower sensitivity ignores friction and minor resistance (useful for heavier curtains or if calibration stops prematurely).
+
+The `sensitivity_name()` reverse-mapping uses boundary thresholds: ≤8 → `extra_low`, ≤20 → `low`, ≤45 → `medium`, ≤80 → `high`, ≤120 → `max`.
 
 **Tuning workflow:**
 
 1. Run `motortest 10` with the curtain free to move. Observe the live load bar and SG values.
 2. Manually apply resistance to the shaft and confirm `STALL!` appears.
-3. If you see false stalls during free movement, use `sensitivity low`.
-4. If calibration stops before reaching the end, also try `sensitivity low`.
+3. If you see false stalls during free movement, use `sensitivity low` or `sensitivity extra_low`.
+4. If calibration stops before reaching the end, also try a lower sensitivity level.
 5. Run `calibrate` once the sensitivity is correct.
 
 During normal movement (non-calibration), stall events are logged in verbose mode but do not stop the motor. Stall detection only drives calibration endpoint detection.
@@ -266,12 +278,26 @@ During normal movement (non-calibration), stall events are logged in verbose mod
 Calibration uses StallGuard4 to find the mechanical travel limits without end-stop switches:
 
 1. The motor drives toward the closed (minimum) position until a stall is detected.
-2. Position is set to 0. The motor backs off 50 steps.
+2. The motor backs off 30 steps. This backed-off position is set as position 0 — the precise safe closed boundary.
 3. The motor drives toward the open (maximum) position until a second stall is detected.
-4. A 2% margin is applied at each end to avoid running into the mechanical stops during normal operation.
+4. The motor backs off 30 steps from the open wall. The usable travel range is the total steps driven minus this open back-off.
 5. The resulting travel range (in steps) is saved to NVS and HA discovery is re-published.
 
+Both back-off margins are accounted for in the stored `steps_per_revolution` so position 0% and 100% reliably stop before the mechanical limits.
+
 Trigger via WebSerial (`calibrate`), MQTT (`<root>/calibrate` with payload `press`), or the HA Calibrate button entity.
+
+---
+
+## Direction Invert
+
+If your curtain moves in the wrong direction (open closes it, close opens it), use the invert feature:
+
+- **WebSerial**: `invert` — toggles and persists immediately
+- **HA switch**: `switch.<hostname>_invert` — toggle from the Home Assistant UI
+- **MQTT**: publish `ON` or `OFF` to `<root>/invert/set`
+
+Inversion is implemented via the TMC2209 `shaft` register bit, so it affects the driver-level step direction without changing any wiring or logic. The setting is stored in NVS and survives reboots.
 
 ---
 
@@ -309,6 +335,30 @@ arduino-cli upload \
 ```
 
 Or use the Arduino IDE's **Sketch > Upload Using Programmer** after selecting the network port.
+
+---
+
+## Troubleshooting
+
+### TMC2209 not responding
+
+Check UART wiring: GPIO 21 (TX) through a 1K resistor to PDN_UART, GPIO 20 (RX) directly to PDN_UART. The resistor is required — without it, TX drives the bus low during driver responses and corrupts communication.
+
+### Calibration stops too early
+
+The motor stalls before reaching the physical end. Lower the sensitivity: `sensitivity extra_low` or `sensitivity low`. Run `motortest 10` to see the load values during free movement and confirm you have clearance above the stall threshold.
+
+### Curtain moves the wrong direction
+
+Use `invert` in WebSerial, the Invert Direction switch in Home Assistant, or toggle `<root>/invert/set` via MQTT. No re-wiring or recompiling is needed.
+
+### MQTT not connecting
+
+Verify the MQTT server IP, port, username, and password in the setup page. The device uses exponential backoff (2s to 60s) between retries. The `config` command shows the currently configured MQTT server and user.
+
+### Position drifts over time
+
+Run `calibrate` to re-establish the travel range. If the motor skips steps under load, increase the motor current (`current <mA>`) or lower the speed (`speed <us>`).
 
 ---
 
