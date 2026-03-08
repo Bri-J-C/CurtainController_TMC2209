@@ -1,10 +1,12 @@
 // ============================================================================
-// CURTAIN CONTROLLER v5.2 - TMC2209 Edition
+// CURTAIN CONTROLLER v5.3 - TMC2209 Edition
 // Based on original v4.3 with TMC2209 UART control added
 // ============================================================================
 // Target: ESP32-C3 Super Mini
 // Driver: TMC2209 with UART control and StallGuard4
 // ============================================================================
+
+#define FW_VERSION "5.3"
 
 #include <esp_netif.h>
 #include <WiFi.h>
@@ -55,6 +57,7 @@ uint16_t motor_current_ma = 800;
 uint16_t motor_microsteps = 2;
 uint8_t stall_threshold = 50;
 bool tmc_verbose = false;  // Verbose mode for TMC diagnostics
+bool invert_direction = false;  // Swap open/close direction
 
 // Motor control
 int current_position = 0;
@@ -138,6 +141,8 @@ String mqtt_stallthreshold_set_topic;
 String mqtt_stallthreshold_state_topic;
 String mqtt_microsteps_set_topic;
 String mqtt_microsteps_state_topic;
+String mqtt_invert_set_topic;
+String mqtt_invert_state_topic;
 String ws_pending_command;
 
 // ============================================================================
@@ -220,6 +225,28 @@ void output(const char* fmt, ...) {
     WebSerial.print(buf);
 }
 
+// Send a complete String as one WebSocket message (instant display, no line-by-line)
+void ws_send_bulk(const String& text) {
+  Serial.print(text);
+  if (WebSerial.getConnectionCount() > 0) {
+    auto* buf = WebSerial.makeBuffer(text.length());
+    if (buf) {
+      memcpy(buf->get(), text.c_str(), text.length());
+      WebSerial.send(buf);
+    }
+  }
+}
+
+// Append formatted text to a String buffer (for building bulk output)
+void buf_printf(String& out, const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  out += buf;
+}
+
 // ============================================================================
 // STALLGUARD ISR
 // ============================================================================
@@ -292,6 +319,9 @@ void setup_tmc2209() {
 
   // Configure DIAG pin for stall output
   driver.GCONF(driver.GCONF() | (1 << 5));
+
+  // Apply direction inversion (after GCONF setup so it doesn't get overwritten)
+  driver.shaft(invert_direction);
 
   // Attach interrupt for stall detection
   attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stall_isr, RISING);
@@ -578,22 +608,23 @@ void handle_calibration() {
         }
 
         if (cal_state == CAL_FIND_MIN) {
-          current_position = 0;
-          save_position();
-          log_msg(LOG_INFO, "CAL", "Found closed position (min)");
+          log_msg(LOG_INFO, "CAL", "Found closed boundary");
 
           delay(30);
           yield();
           digitalWrite(DIR_PIN, HIGH);
           delayMicroseconds(10);
 
-          // Back off a bit
-          for (int i = 0; i < 50; i++) {
+          // Back off from close wall — this becomes our safe "position 0"
+          const int close_backoff = 30;
+          for (int i = 0; i < close_backoff; i++) {
             step_motor();
             delayMicroseconds(step_delay_us);
-            if (i % 10 == 0) yield();  // Yield every 10 steps
+            if (i % 10 == 0) yield();
           }
-          current_position = 50;
+          current_position = 0;  // This backed-off spot IS position 0
+          save_position();
+          log_msg(LOG_INFO, "CAL", "Backed off %d steps, set as position 0", close_backoff);
 
           stall_flag = false;
           cal_last_stall_check = millis();
@@ -601,31 +632,32 @@ void handle_calibration() {
           log_msg(LOG_INFO, "CAL", "Finding open position (max)...");
 
         } else if (cal_state == CAL_FIND_MAX) {
-          int total = current_position;
-          log_msg(LOG_INFO, "CAL", "Found open position at %d steps", total);
+          int raw_travel = current_position;
+          log_msg(LOG_INFO, "CAL", "Found open boundary at %d steps from safe-close", raw_travel);
 
           delay(30);
           yield();
           digitalWrite(DIR_PIN, LOW);
           delayMicroseconds(10);
 
-          // Back off
-          for (int i = 0; i < 30; i++) {
+          // Back off from open wall — this becomes our max position
+          const int open_backoff = 30;
+          for (int i = 0; i < open_backoff; i++) {
             step_motor();
             delayMicroseconds(step_delay_us);
-            current_position--;
-            if (i % 10 == 0) yield();  // Yield every 10 steps
+            if (i % 10 == 0) yield();
           }
 
-          // Apply 2% margin each side
-          int margin = total / 50;
-          steps_per_revolution = total - (margin * 2);
+          // Usable range = raw travel minus the open back-off
+          // (close back-off already accounted for in position 0)
+          steps_per_revolution = raw_travel - open_backoff;
           current_position = steps_per_revolution;
 
           preferences.putInt("steps_per_rev", steps_per_revolution);
           save_position();
 
-          log_msg(LOG_INFO, "CAL", "Calibration complete! Range: %d steps", steps_per_revolution);
+          log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps (raw: %d, margins: %d+%d)",
+                  steps_per_revolution, raw_travel, 30, open_backoff);
 
           cal_state = CAL_IDLE;
           is_moving = false;
@@ -707,7 +739,7 @@ void publish_ha_discovery(bool force) {
   device["name"] = device_hostname;
   device["model"] = "CurtainController-TMC2209";
   device["manufacturer"] = "DIY";
-  device["sw_version"] = "5.2";
+  device["sw_version"] = FW_VERSION;
   device["configuration_url"] = "http://" + WiFi.localIP().toString() + "/setup";
 
   String json;
@@ -812,7 +844,7 @@ void publish_ha_discovery(bool force) {
     doc["command_topic"] = mqtt_stallthreshold_set_topic;
     doc["state_topic"] = mqtt_stallthreshold_state_topic;
     JsonArray options = doc.createNestedArray("options");
-    options.add("low"); options.add("medium"); options.add("high");
+    options.add("extra_low"); options.add("low"); options.add("medium"); options.add("high"); options.add("max");
     doc["icon"] = "mdi:gauge";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
@@ -851,6 +883,28 @@ void publish_ha_discovery(bool force) {
     client.publish(topic.c_str(), json.c_str(), true);
   }
 
+  // Invert direction switch entity
+  {
+    String topic = "homeassistant/switch/" + device_hostname + "_invert/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "Invert Direction";
+    doc["unique_id"] = "curtain_" + device_hostname + "_invert";
+    doc["object_id"] = device_hostname + "_invert";
+    doc["command_topic"] = mqtt_invert_set_topic;
+    doc["state_topic"] = mqtt_invert_state_topic;
+    doc["icon"] = "mdi:swap-horizontal";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
   // Remove old stallthreshold number entity (replaced by sensitivity select)
   String old_topic = "homeassistant/number/" + device_hostname + "_stallthreshold/config";
   client.publish(old_topic.c_str(), "", true);
@@ -868,6 +922,7 @@ void publish_settings_state() {
   client.publish(mqtt_stallthreshold_state_topic.c_str(), sensitivity_name(stall_threshold), true);
   snprintf(buf, sizeof(buf), "%d", motor_microsteps);
   client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
+  client.publish(mqtt_invert_state_topic.c_str(), invert_direction ? "ON" : "OFF", true);
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
@@ -902,9 +957,11 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   }
   if (strcmp(topic, mqtt_stallthreshold_set_topic.c_str()) == 0) {
     uint8_t value;
-    if (msg == "low") value = 15;
+    if (msg == "extra_low") value = 5;
+    else if (msg == "low") value = 15;
     else if (msg == "medium") value = 30;
     else if (msg == "high") value = 60;
+    else if (msg == "max") value = 100;
     else return;
     set_stall_threshold(value);
     log_msg(LOG_INFO, "MQTT", "Sensitivity set to %s (threshold=%d)", msg.c_str(), stall_threshold);
@@ -921,6 +978,17 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       snprintf(buf, sizeof(buf), "%d", motor_microsteps);
       client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
     }
+    return;
+  }
+
+  // Invert direction switch
+  if (strcmp(topic, mqtt_invert_set_topic.c_str()) == 0) {
+    bool value = (msg == "on" || msg == "true" || msg == "1");
+    invert_direction = value;
+    preferences.putBool("invert_dir", invert_direction);
+    if (tmc_available) driver.shaft(invert_direction);
+    log_msg(LOG_INFO, "MQTT", "Direction invert set to %s", invert_direction ? "ON" : "OFF");
+    client.publish(mqtt_invert_state_topic.c_str(), invert_direction ? "ON" : "OFF", true);
     return;
   }
 
@@ -990,6 +1058,7 @@ void connect_mqtt() {
     client.subscribe(mqtt_current_set_topic.c_str());
     client.subscribe(mqtt_stallthreshold_set_topic.c_str());
     client.subscribe(mqtt_microsteps_set_topic.c_str());
+    client.subscribe(mqtt_invert_set_topic.c_str());
     client.publish(mqtt_availability_topic.c_str(), "online", true);
     publish_position();
     publish_status(current_position >= steps_per_revolution ? "open" :
@@ -1023,6 +1092,8 @@ void setup_mqtt() {
   mqtt_stallthreshold_state_topic = mqtt_root_topic + "/stallthreshold/state";
   mqtt_microsteps_set_topic = mqtt_root_topic + "/microsteps/set";
   mqtt_microsteps_state_topic = mqtt_root_topic + "/microsteps/state";
+  mqtt_invert_set_topic = mqtt_root_topic + "/invert/set";
+  mqtt_invert_state_topic = mqtt_root_topic + "/invert/state";
 
   client.setBufferSize(2048);
   client.setServer(mqtt_server.c_str(), mqtt_port);
@@ -1103,9 +1174,11 @@ void cmd_current(const String& param) {
 
 // Map sensitivity name to SGTHRS value
 static const char* sensitivity_name(uint8_t thr) {
+  if (thr <= 8) return "extra_low";
   if (thr <= 20) return "low";
   if (thr <= 45) return "medium";
   if (thr <= 80) return "high";
+  if (thr <= 120) return "max";
   return "custom";
 }
 
@@ -1125,12 +1198,16 @@ void cmd_sensitivity(const String& param) {
   p.trim();
   p.toLowerCase();
 
-  if (p == "low") {
+  if (p == "extra_low" || p == "extralow" || p == "xlow") {
+    apply_sensitivity(5, "extra_low");
+  } else if (p == "low") {
     apply_sensitivity(15, "low");
   } else if (p == "medium" || p == "med") {
     apply_sensitivity(30, "medium");
   } else if (p == "high") {
     apply_sensitivity(60, "high");
+  } else if (p == "max") {
+    apply_sensitivity(100, "max");
   } else if (p.startsWith("custom ")) {
     int value = p.substring(7).toInt();
     if (value >= 0 && value <= 255) {
@@ -1143,7 +1220,7 @@ void cmd_sensitivity(const String& param) {
     output("Sensitivity: %s (threshold=%d, stalls when load drops below %d)\n",
            sensitivity_name(stall_threshold), stall_threshold, stall_threshold * 2);
   } else {
-    log_msg(LOG_ERROR, "CMD", "sensitivity: use low, medium, high, or custom <0-255>");
+    log_msg(LOG_ERROR, "CMD", "sensitivity: use extra_low, low, medium, high, max, or custom <0-255>");
   }
 }
 
@@ -1194,26 +1271,39 @@ void cmd_hadiscovery(const String& param) {
 
 void cmd_config(const String& param) {
   String mqtt_topic = preferences.getString("mqtt_root_topic", "home/room/curtains");
+  String out;
+  out.reserve(700);
 
-  output("\n=== Configuration ===\n");
-  output("Hostname: %s\n", device_hostname.c_str());
-  output("IP: %s\n", WiFi.localIP().toString().c_str());
-  output("SSID: %s\n", WiFi.SSID().c_str());
-  output("RSSI: %d dBm\n", WiFi.RSSI());
-  output("MAC: %s\n", WiFi.macAddress().c_str());
-  output("MQTT: %s:%d\n", mqtt_server.c_str(), mqtt_port);
-  output("MQTT User: %s\n", mqtt_user.length() > 0 ? mqtt_user.c_str() : "(none)");
-  output("MQTT Topic: %s\n", mqtt_topic.c_str());
-  output("Speed: %d us/step (lower=faster)\n", step_delay_us);
-  output("Microsteps: %d\n", motor_microsteps);
-  output("Current: %d mA\n", motor_current_ma);
-  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
-  output("Travel Steps: %d\n", steps_per_revolution);
-  output("Sleep Timeout: %lu ms\n", motor_sleep_timeout);
-  output("TMC2209: %s\n", tmc_available ? "OK" : "NOT CONNECTED");
-  output("Log level: %s\n", log_level_name(current_log_level));
-  output("Setup: http://%s/setup\n", WiFi.localIP().toString().c_str());
-  output("====================\n");
+  buf_printf(out, "\n=== Configuration ===\n");
+  buf_printf(out, "Hostname: %s\n", device_hostname.c_str());
+  buf_printf(out, "IP: %s\n", WiFi.localIP().toString().c_str());
+  buf_printf(out, "SSID: %s\n", WiFi.SSID().c_str());
+  buf_printf(out, "RSSI: %d dBm\n", WiFi.RSSI());
+  buf_printf(out, "MAC: %s\n", WiFi.macAddress().c_str());
+  buf_printf(out, "MQTT: %s:%d\n", mqtt_server.c_str(), mqtt_port);
+  buf_printf(out, "MQTT User: %s\n", mqtt_user.length() > 0 ? mqtt_user.c_str() : "(none)");
+  buf_printf(out, "MQTT Topic: %s\n", mqtt_topic.c_str());
+  buf_printf(out, "Speed: %d us/step (lower=faster)\n", step_delay_us);
+  buf_printf(out, "Microsteps: %d\n", motor_microsteps);
+  buf_printf(out, "Current: %d mA\n", motor_current_ma);
+  buf_printf(out, "Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
+  buf_printf(out, "Travel Steps: %d\n", steps_per_revolution);
+  buf_printf(out, "Invert Direction: %s\n", invert_direction ? "YES" : "NO");
+  buf_printf(out, "Sleep Timeout: %lu ms\n", motor_sleep_timeout);
+  buf_printf(out, "TMC2209: %s\n", tmc_available ? "OK" : "NOT CONNECTED");
+  buf_printf(out, "Log level: %s\n", log_level_name(current_log_level));
+  buf_printf(out, "Setup: http://%s/setup\n", WiFi.localIP().toString().c_str());
+  buf_printf(out, "====================\n");
+  ws_send_bulk(out);
+}
+
+void cmd_invert(const String& param) {
+  invert_direction = !invert_direction;
+  preferences.putBool("invert_dir", invert_direction);
+  if (tmc_available) driver.shaft(invert_direction);
+  log_msg(LOG_INFO, "CMD", "Direction invert: %s", invert_direction ? "ON" : "OFF");
+  if (client.connected())
+    client.publish(mqtt_invert_state_topic.c_str(), invert_direction ? "ON" : "OFF", true);
 }
 
 void cmd_restart(const String& param) {
@@ -1223,65 +1313,71 @@ void cmd_restart(const String& param) {
 }
 
 void cmd_help(const String& param) {
-  output("\n=== Movement ===\n");
-  output("open              Open curtain\n");
-  output("close             Close curtain\n");
-  output("stop              Stop movement / cancel calibrate\n");
-  output("<0-100>           Move to percentage\n");
-  output("\n=== Settings ===\n");
-  output("speed <us>        Step delay (100-10000, lower=faster)\n");
-  output("current <mA>      Motor current (100-2000)\n");
-  output("microsteps <n>    Microsteps (1,2,4,8,16,32,64,128,256)\n");
-  output("sensitivity <lvl> Stall sensitivity (low|medium|high|custom N)\n");
-  output("sleep <ms>        Motor sleep timeout (0=never)\n");
-  output("travelsteps <n>   Total travel range in steps\n");
-  output("\n=== Calibration ===\n");
-  output("calibrate         Find curtain travel range automatically\n");
-  output("motortest [sec]   Test motor and check sensitivity (default 5s)\n");
-  output("\n=== Diagnostics ===\n");
-  output("status            Position, motor, MQTT, TMC status\n");
-  output("config            Full configuration dump\n");
-  output("verbose           Toggle SG debug during movement\n");
-  output("loglevel <level>  Set log level (error|warn|info|debug)\n");
-  output("ledon / ledoff    Manual LED control\n");
-  output("\n=== System ===\n");
-  output("setposition <n>   Override position counter (use with care)\n");
-  output("hadiscovery       Republish HA discovery\n");
-  output("restart           Reboot device\n");
+  static const char help_text[] PROGMEM =
+    "\n=== Movement ===\n"
+    "open              Open curtain\n"
+    "close             Close curtain\n"
+    "stop              Stop movement / cancel calibrate\n"
+    "<0-100>           Move to percentage\n"
+    "\n=== Settings ===\n"
+    "speed <us>        Step delay (100-10000, lower=faster)\n"
+    "current <mA>      Motor current (100-2000)\n"
+    "microsteps <n>    Microsteps (1,2,4,8,16,32,64,128,256)\n"
+    "sensitivity <lvl> Stall sensitivity (extra_low|low|medium|high|max|custom N)\n"
+    "invert            Toggle open/close direction\n"
+    "sleep <ms>        Motor sleep timeout (0=never)\n"
+    "travelsteps <n>   Total travel range in steps\n"
+    "\n=== Calibration ===\n"
+    "calibrate         Find curtain travel range automatically\n"
+    "motortest [sec]   Test motor and check sensitivity (default 5s)\n"
+    "\n=== Diagnostics ===\n"
+    "status            Position, motor, MQTT, TMC status\n"
+    "config            Full configuration dump\n"
+    "verbose           Toggle SG debug during movement\n"
+    "loglevel <level>  Set log level (error|warn|info|debug)\n"
+    "ledon / ledoff    Manual LED control\n"
+    "\n=== System ===\n"
+    "setposition <n>   Override position counter (use with care)\n"
+    "hadiscovery       Republish HA discovery\n"
+    "restart           Reboot device\n";
+  ws_send_bulk(String(help_text));
 }
 
 void cmd_status(const String& param) {
-  output("\n=== Status ===\n");
-  output("Position: %d (%d%%)\n", current_position,
-         (current_position * 100) / steps_per_revolution);
-  output("Moving: %s\n", is_moving ? "Yes" : "No");
-  if (is_moving) {
-    output("Target: %d\n", target_position);
-  }
-  output("Motor: %s\n", motor_enabled ? "Enabled" : "Disabled");
-  output("MQTT: %s\n", client.connected() ? "Connected" : "Disconnected");
+  String out;
+  out.reserve(600);
 
-  // TMC2209 live status
+  buf_printf(out, "\n=== Status ===\n");
+  buf_printf(out, "Position: %d (%d%%)\n", current_position,
+         (current_position * 100) / steps_per_revolution);
+  buf_printf(out, "Moving: %s\n", is_moving ? "Yes" : "No");
+  if (is_moving) {
+    buf_printf(out, "Target: %d\n", target_position);
+  }
+  buf_printf(out, "Motor: %s\n", motor_enabled ? "Enabled" : "Disabled");
+  buf_printf(out, "MQTT: %s\n", client.connected() ? "Connected" : "Disconnected");
+
   if (tmc_available) {
     uint32_t drv_status = driver.DRV_STATUS();
     uint16_t sg = driver.SG_RESULT();
-    output("-- TMC2209 --\n");
-    output("SG_RESULT: %d\n", sg);
-    output("Current scale: %d/31\n", (drv_status >> 16) & 0x1F);
-    output("Standstill: %s\n", (drv_status >> 31) & 1 ? "Yes" : "No");
-    output("OT warning: %s\n", (drv_status >> 0) & 1 ? "Yes" : "No");
-    output("DIAG pin: %s\n", digitalRead(DIAG_PIN) ? "HIGH" : "LOW");
+    buf_printf(out, "-- TMC2209 --\n");
+    buf_printf(out, "SG_RESULT: %d\n", sg);
+    buf_printf(out, "Current scale: %d/31\n", (drv_status >> 16) & 0x1F);
+    buf_printf(out, "Standstill: %s\n", (drv_status >> 31) & 1 ? "Yes" : "No");
+    buf_printf(out, "OT warning: %s\n", (drv_status >> 0) & 1 ? "Yes" : "No");
+    buf_printf(out, "DIAG pin: %s\n", digitalRead(DIAG_PIN) ? "HIGH" : "LOW");
   } else {
-    output("TMC2209: NOT CONNECTED\n");
+    buf_printf(out, "TMC2209: NOT CONNECTED\n");
   }
 
-  output("-- System --\n");
-  output("Heap: %u bytes\n", ESP.getFreeHeap());
+  buf_printf(out, "-- System --\n");
+  buf_printf(out, "Heap: %u bytes\n", ESP.getFreeHeap());
   unsigned long uptime = millis() / 1000;
-  output("Uptime: %lud %luh %lum %lus\n", uptime / 86400, (uptime % 86400) / 3600, (uptime % 3600) / 60, uptime % 60);
-  output("Last reset: %s\n", last_reset_reason);
-  output("Log level: %s\n", log_level_name(current_log_level));
-  output("==============\n");
+  buf_printf(out, "Uptime: %lud %luh %lum %lus\n", uptime / 86400, (uptime % 86400) / 3600, (uptime % 3600) / 60, uptime % 60);
+  buf_printf(out, "Last reset: %s\n", last_reset_reason);
+  buf_printf(out, "Log level: %s\n", log_level_name(current_log_level));
+  buf_printf(out, "==============\n");
+  ws_send_bulk(out);
 }
 
 void cmd_verbose(const String& param) {
@@ -1489,6 +1585,7 @@ const Command commands[] = {
   {"calibrate", cmd_calibrate},
   {"travelsteps ", cmd_travelsteps},
   {"setposition ", cmd_setposition},
+  {"invert", cmd_invert},
   {"sleep ", cmd_sleep},
   {"hadiscovery", cmd_hadiscovery},
   {"config", cmd_config},
@@ -1559,67 +1656,127 @@ void process_command(const String& cmd) {
 
 const char SETUP_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Curtain Controller Setup</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+  <title>Curtain Controller</title>
   <style>
-    body{font-family:Arial,sans-serif;margin:20px;background:#1a1a1a;color:#fff}
-    h1{color:#4CAF50}
-    form{max-width:400px}
-    label{display:block;margin-top:10px;font-weight:bold}
-    input{width:100%;padding:8px;margin-top:4px;box-sizing:border-box;border-radius:4px;border:1px solid #444;background:#333;color:#fff}
-    button{margin-top:20px;padding:12px 24px;background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:16px}
-    button:hover{background:#45a049}
-    .info{color:#888;font-size:12px}
-    h2{color:#4CAF50;margin-top:20px;border-top:1px solid #333;padding-top:15px}
+    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+    :root{--cyan:#00D4FF;--purple:#6366F1;--gradient:linear-gradient(135deg,var(--cyan),var(--purple));--bg:#0a0a1a;--card:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.08);--text:#fff;--dim:rgba(255,255,255,0.5);--success:#10B981}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:var(--bg);background-image:radial-gradient(ellipse at top left,rgba(0,212,255,0.1) 0%,transparent 50%),radial-gradient(ellipse at bottom right,rgba(99,102,241,0.1) 0%,transparent 50%);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center}
+    .container{max-width:420px;width:100%}
+    .header{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:8px}
+    .header svg{width:48px;height:48px;filter:drop-shadow(0 4px 12px rgba(0,212,255,0.3))}
+    h1{font-size:26px;font-weight:700;margin:0;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .subtitle{text-align:center;color:var(--dim);font-size:13px;margin-bottom:24px}
+    .card{background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px}
+    .card h2{font-size:15px;font-weight:600;margin:0 0 14px 0;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    label{display:block;color:var(--dim);font-size:13px;font-weight:500;margin-bottom:4px;margin-top:12px}
+    label:first-of-type{margin-top:0}
+    input,select{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:14px;font-weight:500;transition:border-color 0.2s}
+    input:focus,select:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 3px rgba(0,212,255,0.1)}
+    .hint{color:var(--dim);font-size:11px;margin-top:2px}
+    .btn-row{display:flex;gap:12px;margin-top:20px}
+    .btn{flex:1;padding:14px;font-size:15px;border-radius:12px;border:none;cursor:pointer;font-weight:600;transition:all 0.2s;text-align:center;text-decoration:none}
+    .btn-primary{background:var(--gradient);color:#fff;box-shadow:0 4px 16px rgba(0,212,255,0.3)}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,212,255,0.4)}
+    .btn-secondary{background:var(--card);color:var(--dim);border:1px solid var(--border)}
+    .btn-secondary:hover{border-color:var(--cyan);color:var(--text)}
+    .version{text-align:center;color:rgba(255,255,255,0.15);font-size:10px;margin-top:16px}
   </style>
 </head>
 <body>
-  <h1>Curtain Controller Setup</h1>
-  <p>TMC2209 Edition v5.2</p>
-  <form action="/save" method="POST">
-    <h2>Network</h2>
-    <label>Hostname</label>
-    <input name="hostname" value="%HOSTNAME%">
-    <label>MQTT Server</label>
-    <input name="mqtt_server" value="%MQTT_SERVER%">
-    <label>MQTT Port</label>
-    <input name="mqtt_port" type="number" value="%MQTT_PORT%">
-    <label>MQTT Username</label>
-    <input name="mqtt_user" value="%MQTT_USER%">
-    <label>MQTT Password</label>
-    <input name="mqtt_pass" type="password" value="%MQTT_PASS%">
-    <label>MQTT Root Topic</label>
-    <input name="mqtt_topic" value="%MQTT_TOPIC%">
-    <p class="info">Creates: /cmd, /status, /position, /availability</p>
+  <div class="container">
+    <div class="header">
+      <svg viewBox="0 0 512 512" fill="none">
+        <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00D4FF"/><stop offset="100%" stop-color="#6366F1"/></linearGradient></defs>
+        <rect x="108" y="100" width="296" height="28" rx="4" fill="url(#g)"/>
+        <rect x="108" y="86" width="32" height="56" rx="4" fill="url(#g)"/>
+        <rect x="372" y="86" width="32" height="56" rx="4" fill="url(#g)"/>
+        <rect x="140" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+        <rect x="176" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+        <rect x="212" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+        <rect x="274" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+        <rect x="310" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+        <rect x="346" y="140" width="26" height="300" rx="3" fill="url(#g)"/>
+      </svg>
+      <h1>Curtain Controller</h1>
+    </div>
+    <div class="subtitle">TMC2209 Edition &middot; %HOSTNAME%</div>
 
-    <h2>Motor</h2>
-    <label>Steps per Revolution</label>
-    <input name="steps" type="number" value="%STEPS%">
-    <label>Current (mA)</label>
-    <input name="current" type="number" value="%CURRENT%" min="100" max="2000">
-    <label>Microsteps</label>
-    <input name="microsteps" type="number" value="%MICROSTEPS%">
-    <p class="info">Valid: 1, 2, 4, 8, 16, 32, 64, 128, 256</p>
-    <label>Stall Threshold</label>
-    <input name="stallthreshold" type="number" value="%STALLTHRESHOLD%" min="0" max="255">
-    <p class="info">Higher = less sensitive (0-255)</p>
+    <form action="/save" method="POST">
+      <div class="card">
+        <h2>Network</h2>
+        <label>Hostname</label>
+        <input name="hostname" value="%HOSTNAME%">
+        <label>MQTT Server</label>
+        <input name="mqtt_server" value="%MQTT_SERVER%">
+        <label>MQTT Port</label>
+        <input name="mqtt_port" type="number" value="%MQTT_PORT%">
+        <label>MQTT Username</label>
+        <input name="mqtt_user" value="%MQTT_USER%">
+        <label>MQTT Password</label>
+        <input name="mqtt_pass" type="password" value="%MQTT_PASS%">
+        <label>MQTT Root Topic</label>
+        <input name="mqtt_topic" value="%MQTT_TOPIC%">
+        <div class="hint">Creates: /cmd, /status, /position, /availability</div>
+      </div>
 
-    <h2>System</h2>
-    <label>OTA Password</label>
-    <input name="ota_pass" type="password" placeholder="Leave blank to keep current">
-    <p class="info">Device will reboot after saving.</p>
-    <button type="submit">Save &amp; Reboot</button>
-  </form>
+      <div class="card">
+        <h2>Motor</h2>
+        <label>Travel Steps</label>
+        <input name="steps" type="number" value="%STEPS%">
+        <label>Current (mA)</label>
+        <input name="current" type="number" value="%CURRENT%" min="100" max="2000">
+        <label>Microsteps</label>
+        <select name="microsteps">
+          <option value="1" %MS1%>1</option><option value="2" %MS2%>2</option>
+          <option value="4" %MS4%>4</option><option value="8" %MS8%>8</option>
+          <option value="16" %MS16%>16</option><option value="32" %MS32%>32</option>
+          <option value="64" %MS64%>64</option><option value="128" %MS128%>128</option>
+          <option value="256" %MS256%>256</option>
+        </select>
+        <label>Stall Sensitivity</label>
+        <select name="stallthreshold">
+          <option value="5" %SEN_XL%>Extra Low (5)</option>
+          <option value="15" %SEN_LO%>Low (15)</option>
+          <option value="30" %SEN_MD%>Medium (30)</option>
+          <option value="60" %SEN_HI%>High (60)</option>
+          <option value="100" %SEN_MX%>Max (100)</option>
+        </select>
+      </div>
+
+      <div class="card">
+        <h2>System</h2>
+        <label>OTA Password</label>
+        <input name="ota_pass" type="password" placeholder="Leave blank to keep current">
+        <div class="hint">Device will reboot after saving.</div>
+      </div>
+
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">Save &amp; Reboot</button>
+        <a href="/webserial" class="btn btn-secondary">Console</a>
+      </div>
+    </form>
+
+    <div class="version">v%VERSION%</div>
+  </div>
 </body>
 </html>
 )rawliteral";
 
 void setup_webserial() {
+  // Root redirects to setup
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->redirect("/setup");
+  });
+
   server.on("/setup", HTTP_GET, [](AsyncWebServerRequest *request) {
     String html = FPSTR(SETUP_HTML);
-    html.replace("%HOSTNAME%", preferences.getString("hostname", "CurtainController"));
+    String hostname = preferences.getString("hostname", "CurtainController");
+    html.replace("%HOSTNAME%", hostname);
+    html.replace("%VERSION%", FW_VERSION);
     html.replace("%MQTT_SERVER%", preferences.getString("mqtt_server", "192.168.1.100"));
     html.replace("%MQTT_PORT%", String(preferences.getInt("mqtt_port", 1883)));
     html.replace("%MQTT_USER%", preferences.getString("mqtt_user", "your_mqtt_user"));
@@ -1627,8 +1784,27 @@ void setup_webserial() {
     html.replace("%MQTT_TOPIC%", preferences.getString("mqtt_root_topic", "home/room/curtains"));
     html.replace("%STEPS%", String(preferences.getInt("steps_per_rev", 2000)));
     html.replace("%CURRENT%", String(preferences.getUShort("current_ma", 800)));
-    html.replace("%MICROSTEPS%", String(preferences.getUShort("microsteps", 2)));
-    html.replace("%STALLTHRESHOLD%", String(preferences.getUChar("stall_thr", 50)));
+
+    // Microsteps dropdown selected state
+    uint16_t ms = preferences.getUShort("microsteps", 2);
+    html.replace("%MS1%", ms == 1 ? "selected" : "");
+    html.replace("%MS2%", ms == 2 ? "selected" : "");
+    html.replace("%MS4%", ms == 4 ? "selected" : "");
+    html.replace("%MS8%", ms == 8 ? "selected" : "");
+    html.replace("%MS16%", ms == 16 ? "selected" : "");
+    html.replace("%MS32%", ms == 32 ? "selected" : "");
+    html.replace("%MS64%", ms == 64 ? "selected" : "");
+    html.replace("%MS128%", ms == 128 ? "selected" : "");
+    html.replace("%MS256%", ms == 256 ? "selected" : "");
+
+    // Sensitivity dropdown selected state
+    uint8_t st = preferences.getUChar("stall_thr", 50);
+    html.replace("%SEN_XL%", st <= 8 ? "selected" : "");
+    html.replace("%SEN_LO%", (st > 8 && st <= 20) ? "selected" : "");
+    html.replace("%SEN_MD%", (st > 20 && st <= 45) ? "selected" : "");
+    html.replace("%SEN_HI%", (st > 45 && st <= 80) ? "selected" : "");
+    html.replace("%SEN_MX%", st > 80 ? "selected" : "");
+
     request->send(200, "text/html", html);
   });
 
@@ -1673,7 +1849,7 @@ void setup_webserial() {
     }
     preferences.putBool("ha_disc_done", false);
 
-    request->send(200, "text/html", "<html><body><h1>Saved!</h1><p>Rebooting...</p></body></html>");
+    request->send(200, "text/html", "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:-apple-system,sans-serif;background:#0a0a1a;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{background:linear-gradient(135deg,#00D4FF,#6366F1);-webkit-background-clip:text;-webkit-text-fill-color:transparent}</style></head><body><div><h1>Saved!</h1><p style='color:rgba(255,255,255,0.5)'>Rebooting...</p></div></body></html>");
     delay(1000);
     ESP.restart();
   });
@@ -2024,6 +2200,7 @@ void setup() {
   motor_current_ma = preferences.getUShort("current_ma", 800);
   motor_microsteps = preferences.getUShort("microsteps", 2);
   stall_threshold = preferences.getUChar("stall_thr", 50);
+  invert_direction = preferences.getBool("invert_dir", false);
 
   pinMode(STATUS_LED, OUTPUT);
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
