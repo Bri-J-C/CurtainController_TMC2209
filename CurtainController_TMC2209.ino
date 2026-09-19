@@ -60,14 +60,13 @@ bool tmc_verbose = false;  // Verbose mode for TMC diagnostics
 bool invert_direction = false;  // Swap open/close direction
 
 // Motor control
-int current_position = 0;
+volatile int current_position = 0;  // written by step ISR while moving
 int target_position = 0;
 bool is_moving = false;
-unsigned long last_step_time = 0;
 unsigned long movement_start_time = 0;
 const unsigned long MOVEMENT_TIMEOUT = 120000;  // 2 minute timeout
-int steps_since_last_save = 0;
-const int STEPS_BETWEEN_SAVES = 50;
+unsigned long last_position_save = 0;
+const unsigned long POSITION_SAVE_INTERVAL = 1000;
 unsigned long last_position_report = 0;
 const unsigned long POSITION_REPORT_INTERVAL = 500;
 
@@ -78,13 +77,10 @@ unsigned long motor_sleep_timeout = 30000;
 unsigned long last_motor_activity = 0;
 
 // Calibration state
-enum CalibrationState { CAL_IDLE, CAL_FIND_MIN, CAL_FIND_MAX };
+enum CalibrationState { CAL_IDLE, CAL_FIND_MIN, CAL_BACKOFF_MIN, CAL_FIND_MAX, CAL_BACKOFF_MAX };
 CalibrationState cal_state = CAL_IDLE;
 unsigned long cal_start_time = 0;
-unsigned long cal_last_stall_check = 0;
 const unsigned long CAL_TIMEOUT = 240000;
-const unsigned long STALL_DEBOUNCE_MS = 50;
-volatile bool stall_flag = false;
 
 // Reset button with debouncing
 unsigned long button_press_start = 0;
@@ -174,7 +170,6 @@ void process_command(const String& command);
 void stop_motor();
 void wake_motor();
 void sleep_motor();
-void step_motor();
 void start_movement(int target);
 void start_calibration();
 void check_tmc_errors();
@@ -248,11 +243,116 @@ void buf_printf(String& out, const char* fmt, ...) {
 }
 
 // ============================================================================
-// STALLGUARD ISR
+// STEP GENERATOR + STALLGUARD
 // ============================================================================
+// Steps come from a hardware timer ISR, not loop(). On the single-core C3,
+// WiFi/MQTT/UART work in loop() delays steps by milliseconds; StallGuard4
+// (especially with MicroPlyer at low microsteps) reads that jitter as load
+// and reports false stalls.
 
-void IRAM_ATTR stall_isr() {
-  stall_flag = true;
+const uint32_t STEPS_UNLIMITED = 0xFFFFFFFF;
+const uint32_t RAMP_TIME_US = 300000;    // accel/decel ramp duration
+const uint32_t STALL_BLANK_US = 200000;  // ignore StallGuard this long after reaching cruise speed
+const uint8_t STALL_CONFIRM = 4;         // stall score to confirm (~consecutive stalled full steps)
+const int CAL_BACKOFF_FULLSTEPS = 15;    // back-off from each wall during calibration
+
+hw_timer_t* step_timer = nullptr;
+bool step_timer_on = false;
+volatile bool step_running = false;
+volatile int8_t step_dir = 1;
+volatile uint32_t steps_left = 0;
+volatile uint32_t steps_done = 0;
+uint32_t step_period_us = 0;
+uint32_t step_cruise_us = 2000;
+uint32_t step_ramp_steps = 1;
+
+// Stall detection, evaluated in the step ISR once per full step
+volatile uint32_t diag_edges = 0;
+uint32_t diag_edges_seen = 0;
+uint32_t stall_blank_steps = 0;
+volatile bool stall_stop_enabled = false;
+volatile uint8_t stall_score = 0;
+volatile uint8_t stall_score_max = 0;
+volatile uint32_t stall_fullsteps = 0;
+
+void IRAM_ATTR diag_isr() {
+  diag_edges = diag_edges + 1;
+}
+
+void IRAM_ATTR step_isr() {
+  if (!step_running) return;
+
+  REG_WRITE(GPIO_OUT_W1TS_REG, 1UL << STEP_PIN);
+  current_position = current_position + step_dir;
+  steps_done = steps_done + 1;
+  if (steps_left != STEPS_UNLIMITED) steps_left = steps_left - 1;
+
+  // SG_RESULT/DIAG update once per full step, so sample at that rate. A full step
+  // counts as stalled if DIAG pulsed since the last sample or is still high.
+  // Leaky score: isolated spikes decay away, a real stall accumulates.
+  if (steps_done >= stall_blank_steps && steps_done % motor_microsteps == 0) {
+    uint32_t edges = diag_edges;
+    bool hit = (edges != diag_edges_seen) || (REG_READ(GPIO_IN_REG) & (1UL << DIAG_PIN));
+    diag_edges_seen = edges;
+    if (hit) {
+      stall_fullsteps = stall_fullsteps + 1;
+      if (stall_score < 255) stall_score = stall_score + 1;
+      if (stall_score > stall_score_max) stall_score_max = stall_score;
+    } else if (stall_score > 0) {
+      stall_score = stall_score - 1;
+    }
+    if (stall_stop_enabled && stall_score >= STALL_CONFIRM) {
+      step_running = false;
+    }
+  }
+  if (steps_left == 0) step_running = false;
+
+  REG_WRITE(GPIO_OUT_W1TC_REG, 1UL << STEP_PIN);  // work above exceeds the 100ns min high time
+
+  // Velocity ramps linearly with distance from 25% to 100% of cruise; symmetric for decel
+  if (step_running) {
+    uint32_t s = steps_done < steps_left ? steps_done : steps_left;
+    uint32_t p = step_cruise_us;
+    if (s < step_ramp_steps) p = step_cruise_us * 4 * step_ramp_steps / (step_ramp_steps + 3 * s);
+    if (p != step_period_us) {
+      step_period_us = p;
+      timerAlarm(step_timer, p, true, 0);
+    }
+  }
+}
+
+void step_stop() {
+  step_running = false;
+  if (step_timer_on) {
+    timerStop(step_timer);
+    step_timer_on = false;
+  }
+}
+
+// Start stepping in dir (+1 = open). count may be STEPS_UNLIMITED.
+void step_start(int8_t dir, uint32_t count, bool stop_on_stall) {
+  step_stop();
+  step_dir = dir;
+  digitalWrite(DIR_PIN, dir > 0 ? HIGH : LOW);
+  steps_left = count;
+  steps_done = 0;
+  step_cruise_us = step_delay_us;
+  // Ramp duration ~= 1.85 * ramp_steps * cruise period
+  step_ramp_steps = RAMP_TIME_US * 100 / 185 / step_cruise_us + 1;
+  stall_blank_steps = step_ramp_steps + STALL_BLANK_US / step_cruise_us;
+  stall_stop_enabled = stop_on_stall;
+  stall_score = 0;
+  stall_score_max = 0;
+  stall_fullsteps = 0;
+  diag_edges_seen = diag_edges;
+  step_period_us = step_cruise_us * 4;
+  delayMicroseconds(10);  // DIR setup time
+
+  timerWrite(step_timer, 0);
+  timerAlarm(step_timer, step_period_us, true, 0);
+  step_running = true;
+  timerStart(step_timer);
+  step_timer_on = true;
 }
 
 // ============================================================================
@@ -268,6 +368,10 @@ void setup_tmc2209() {
   digitalWrite(STEP_PIN, LOW);
   digitalWrite(DIR_PIN, LOW);
   digitalWrite(ENABLE_PIN, HIGH);  // Disabled
+
+  step_timer = timerBegin(1000000);  // 1 MHz = 1us resolution
+  timerAttachInterrupt(step_timer, &step_isr);
+  timerStop(step_timer);
 
   // Initialize UART for TMC2209
   log_msg(LOG_INFO, "TMC", "Initializing TMC2209 UART...");
@@ -323,8 +427,8 @@ void setup_tmc2209() {
   // Apply direction inversion (after GCONF setup so it doesn't get overwritten)
   driver.shaft(invert_direction);
 
-  // Attach interrupt for stall detection
-  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stall_isr, RISING);
+  // Count DIAG pulses; the step ISR evaluates them once per full step
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), diag_isr, RISING);
 
   log_msg(LOG_INFO, "TMC", "TMC2209 initialized successfully");
 }
@@ -389,6 +493,7 @@ void check_tmc_errors() {
 }
 
 void stop_motor() {
+  step_stop();
   digitalWrite(ENABLE_PIN, HIGH);
   motor_enabled = false;
 }
@@ -406,13 +511,6 @@ void sleep_motor() {
   if (motor_enabled && !is_moving && cal_state == CAL_IDLE) {
     stop_motor();
   }
-}
-
-void step_motor() {
-  digitalWrite(STEP_PIN, HIGH);
-  delayMicroseconds(2);
-  digitalWrite(STEP_PIN, LOW);
-  last_motor_activity = millis();
 }
 
 void save_position() {
@@ -433,30 +531,30 @@ void start_movement(int target) {
   }
 
   wake_motor();
-  stall_flag = false;
 
+  int8_t dir;
   if (target_position > current_position) {
-    digitalWrite(DIR_PIN, HIGH);
+    dir = 1;
     log_msg(LOG_INFO, "MOTOR", "Opening: %d -> %d (%d%%)",
             current_position, target_position,
             (target_position * 100) / steps_per_revolution);
     publish_status("opening");
   } else {
-    digitalWrite(DIR_PIN, LOW);
+    dir = -1;
     log_msg(LOG_INFO, "MOTOR", "Closing: %d -> %d (%d%%)",
             current_position, target_position,
             (target_position * 100) / steps_per_revolution);
     publish_status("closing");
   }
 
-  delayMicroseconds(10);
-
   is_moving = true;
-  last_step_time = micros();
   movement_start_time = millis();
-  steps_since_last_save = 0;
+  last_position_save = millis();
   last_position_report = 0;
   publish_position();
+
+  // Stalls are counted (verbose log) but don't stop normal moves
+  step_start(dir, abs(target_position - current_position), false);
 }
 
 void stop_movement(const char* reason) {
@@ -477,21 +575,6 @@ void stop_movement(const char* reason) {
 void handle_movement() {
   if (!is_moving) return;
 
-  // Periodic yield for WebSocket responsiveness
-  static unsigned long last_move_yield = 0;
-  if (millis() - last_move_yield >= 50) {
-    yield();
-    last_move_yield = millis();
-  }
-
-  // Log stall events in verbose mode (but don't stop - stalls ignored during normal movement)
-  if (stall_flag && tmc_verbose && tmc_available) {
-    uint16_t sg = driver.SG_RESULT();
-    log_msg(LOG_WARN, "MOTOR", "Stall detected SG:%d thr:%d (triggers at SG<%d)",
-            sg, stall_threshold, stall_threshold * 2);
-  }
-  stall_flag = false;
-
   if (millis() - movement_start_time > MOVEMENT_TIMEOUT) {
     log_msg(LOG_ERROR, "MOTOR", "Movement timeout after %lums", MOVEMENT_TIMEOUT);
     publish_status("error_timeout");
@@ -499,42 +582,33 @@ void handle_movement() {
     return;
   }
 
-  unsigned long now = micros();
-  if (now - last_step_time >= (unsigned long)step_delay_us) {
-    last_step_time = now;
+  if (!step_running) {
+    log_msg(LOG_INFO, "MOTOR", "Movement complete, position %d (%d%%)",
+            current_position, (current_position * 100) / steps_per_revolution);
+    stop_movement("Complete");
+    return;
+  }
 
-    if (current_position < target_position) {
-      current_position++;
-    } else {
-      current_position--;
-    }
+  last_motor_activity = millis();
 
-    current_position = constrain(current_position, 0, steps_per_revolution);
-    step_motor();
-
-    if (++steps_since_last_save >= STEPS_BETWEEN_SAVES) {
-      save_position();
-      steps_since_last_save = 0;
-    }
-
-    if (current_position == target_position) {
-      log_msg(LOG_INFO, "MOTOR", "Movement complete, position %d (%d%%)",
-              current_position, (current_position * 100) / steps_per_revolution);
-      stop_movement("Complete");
-    }
+  // Time-based, not per-N-steps: NVS writes mask the step ISR while flash is busy
+  if (millis() - last_position_save >= POSITION_SAVE_INTERVAL) {
+    save_position();
+    last_position_save = millis();
   }
 
   if (millis() - last_position_report >= POSITION_REPORT_INTERVAL) {
     publish_position();
     last_position_report = millis();
 
-    // Verbose TMC output during movement
+    // Verbose TMC output during movement (UART reads no longer disturb step timing)
     if (tmc_verbose && tmc_available) {
       uint16_t sg = driver.SG_RESULT();
       uint32_t drv = driver.DRV_STATUS();
       uint8_t cs = (drv >> 16) & 0x1F;  // Current scale
-      log_msg(LOG_DEBUG, "MOTOR", "SG:%3d CS:%2d/31 DIAG:%d pos:%d",
-              sg, cs, digitalRead(DIAG_PIN), current_position);
+      log_msg(LOG_DEBUG, "MOTOR", "SG:%3d (stall<=%d) CS:%2d/31 stalled_fs:%lu score:%d/%d pos:%d",
+              sg, stall_threshold * 2, cs, stall_fullsteps, stall_score, STALL_CONFIRM,
+              current_position);
     }
   }
 }
@@ -556,118 +630,75 @@ void start_calibration() {
   log_msg(LOG_INFO, "CAL", "Starting sensorless calibration — finding closed position...");
 
   wake_motor();
-  stall_flag = false;
-  cal_last_stall_check = millis();
-
-  digitalWrite(DIR_PIN, LOW);  // Close direction
-  delayMicroseconds(10);
-
   cal_state = CAL_FIND_MIN;
   is_moving = true;
-  last_step_time = micros();
   cal_start_time = millis();
+  step_start(-1, STEPS_UNLIMITED, true);
+}
+
+void abort_calibration(const char* why) {
+  log_msg(LOG_ERROR, "CAL", "Calibration failed: %s", why);
+  cal_state = CAL_IDLE;
+  is_moving = false;
+  stop_motor();
+  publish_status("stopped");
 }
 
 void handle_calibration() {
   if (cal_state == CAL_IDLE) return;
 
-  // Periodic yield for WebSocket responsiveness
-  static unsigned long last_cal_yield = 0;
-  if (millis() - last_cal_yield >= 50) {
-    yield();
-    last_cal_yield = millis();
-  }
-
-  esp_task_wdt_reset();
-
-  // Timeout
   if (millis() - cal_start_time > CAL_TIMEOUT) {
-    log_msg(LOG_ERROR, "CAL", "Calibration timeout after %lums", CAL_TIMEOUT);
-    cal_state = CAL_IDLE;
-    is_moving = false;
+    abort_calibration("timeout, no stall detected (try higher sensitivity)");
     return;
   }
 
-  // Step timing
-  unsigned long now = micros();
-  if (now - last_step_time >= (unsigned long)step_delay_us) {
-    last_step_time = now;
-    step_motor();
+  last_motor_activity = millis();
+  if (step_running) return;
 
-    if (cal_state == CAL_FIND_MAX) {
-      current_position++;
-    }
+  const int backoff = CAL_BACKOFF_FULLSTEPS * motor_microsteps;
 
-    // Check stall with debounce
-    if (stall_flag) {
-      if (millis() - cal_last_stall_check >= STALL_DEBOUNCE_MS) {
-        // Log the stall detection
-        if (tmc_available) {
-          uint16_t sg = driver.SG_RESULT();
-          log_msg(LOG_DEBUG, "CAL", "Stall detected SG:%d thr:%d", sg, stall_threshold);
-        }
+  switch (cal_state) {
+    case CAL_FIND_MIN:
+      log_msg(LOG_INFO, "CAL", "Found closed boundary: stall confirmed after %lu steps (score %d/%d; %lu flagged full steps this run)",
+              steps_done, STALL_CONFIRM, STALL_CONFIRM, stall_fullsteps);
+      step_start(1, backoff, false);
+      cal_state = CAL_BACKOFF_MIN;
+      break;
 
-        if (cal_state == CAL_FIND_MIN) {
-          log_msg(LOG_INFO, "CAL", "Found closed boundary");
+    case CAL_BACKOFF_MIN:
+      current_position = 0;  // This backed-off spot IS position 0
+      save_position();
+      log_msg(LOG_INFO, "CAL", "Backed off %d steps, set as position 0. Finding open position...", backoff);
+      step_start(1, STEPS_UNLIMITED, true);
+      cal_state = CAL_FIND_MAX;
+      break;
 
-          delay(30);
-          yield();
-          digitalWrite(DIR_PIN, HIGH);
-          delayMicroseconds(10);
-
-          // Back off from close wall — this becomes our safe "position 0"
-          const int close_backoff = 30;
-          for (int i = 0; i < close_backoff; i++) {
-            step_motor();
-            delayMicroseconds(step_delay_us);
-            if (i % 10 == 0) yield();
-          }
-          current_position = 0;  // This backed-off spot IS position 0
-          save_position();
-          log_msg(LOG_INFO, "CAL", "Backed off %d steps, set as position 0", close_backoff);
-
-          stall_flag = false;
-          cal_last_stall_check = millis();
-          cal_state = CAL_FIND_MAX;
-          log_msg(LOG_INFO, "CAL", "Finding open position (max)...");
-
-        } else if (cal_state == CAL_FIND_MAX) {
-          int raw_travel = current_position;
-          log_msg(LOG_INFO, "CAL", "Found open boundary at %d steps from safe-close", raw_travel);
-
-          delay(30);
-          yield();
-          digitalWrite(DIR_PIN, LOW);
-          delayMicroseconds(10);
-
-          // Back off from open wall — this becomes our max position
-          const int open_backoff = 30;
-          for (int i = 0; i < open_backoff; i++) {
-            step_motor();
-            delayMicroseconds(step_delay_us);
-            if (i % 10 == 0) yield();
-          }
-
-          // Usable range = raw travel minus the open back-off
-          // (close back-off already accounted for in position 0)
-          steps_per_revolution = raw_travel - open_backoff;
-          current_position = steps_per_revolution;
-
-          preferences.putInt("steps_per_rev", steps_per_revolution);
-          save_position();
-
-          log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps (raw: %d, margins: %d+%d)",
-                  steps_per_revolution, raw_travel, 30, open_backoff);
-
-          cal_state = CAL_IDLE;
-          is_moving = false;
-          publish_position();
-          publish_ha_discovery(true);
-        }
+    case CAL_FIND_MAX:
+      log_msg(LOG_INFO, "CAL", "Found open boundary at %d steps from safe-close: stall confirmed (score %d/%d; %lu flagged full steps this run)",
+              current_position, STALL_CONFIRM, STALL_CONFIRM, stall_fullsteps);
+      if (current_position < 4 * backoff) {
+        abort_calibration("travel too short, likely a false stall (try lower sensitivity, run motortest)");
+        return;
       }
-    } else {
-      cal_last_stall_check = millis();
-    }
+      step_start(-1, backoff, false);
+      cal_state = CAL_BACKOFF_MAX;
+      break;
+
+    case CAL_BACKOFF_MAX:
+      // Close back-off is already accounted for in position 0
+      steps_per_revolution = current_position;
+      preferences.putInt("steps_per_rev", steps_per_revolution);
+      save_position();
+      log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps (margins: %d+%d)",
+              steps_per_revolution, backoff, backoff);
+      cal_state = CAL_IDLE;
+      is_moving = false;
+      publish_position();
+      publish_ha_discovery(true);
+      break;
+
+    default:
+      break;
   }
 }
 
@@ -1393,138 +1424,92 @@ void cmd_motortest(const String& param) {
     output("TMC2209 not available\n");
     return;
   }
+  if (is_moving || cal_state != CAL_IDLE) {
+    output("Motor busy\n");
+    return;
+  }
 
   int duration = param.length() > 0 ? param.toInt() : 5;
   duration = constrain(duration, 1, 60);
-
-  unsigned long test_step_delay = step_delay_us;
-  int steps_between_reads = constrain(motor_microsteps, 4, 32);
+  uint16_t stall_line = stall_threshold * 2;
 
   output("\n=== Motor Test ===\n");
-  output("Duration: %d seconds\n", duration);
-  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
-  output("Apply resistance to the shaft to test stall detection.\n\n");
+  output("Duration: %d s, speed: %d us/step, microsteps: %d\n", duration, step_delay_us, motor_microsteps);
+  output("Sensitivity: %s (threshold=%d, stall when SG<=%d)\n",
+         sensitivity_name(stall_threshold), stall_threshold, stall_line);
+  output("Uses the same detector as calibration. Apply resistance to the shaft to test.\n\n");
 
   wake_motor();
-  digitalWrite(DIR_PIN, HIGH);
-  delayMicroseconds(100);
-  stall_flag = false;
+  step_start(1, STEPS_UNLIMITED, false);  // count stalls, don't stop
 
-  // Ramp up (500ms)
-  output("Ramping up...\n");
-  unsigned long ramp_start = millis();
-  unsigned long last_step = micros();
-  unsigned long current_delay = test_step_delay * 3;
-  unsigned long last_yield = millis();
-
-  while (millis() - ramp_start < 500) {
-    unsigned long now = micros();
-    if (now - last_step >= current_delay) {
-      step_motor();
-      last_step = now;
-      if (current_delay > test_step_delay) {
-        current_delay -= 2;
-        if (current_delay < test_step_delay) current_delay = test_step_delay;
-      }
-    }
-    if (millis() - last_yield >= 50) {
-      yield();
-      esp_task_wdt_reset();
-      last_yield = millis();
-    }
-  }
-
-  output("Running...\n\n");
-
-  // Measurement phase
   unsigned long test_start = millis();
-  uint16_t min_sg = 1023, max_sg = 0;
-  uint32_t sg_sum = 0, sg_count = 0;
-  int step_count = 0, stall_events = 0;
-  unsigned long last_report = 0;
-  uint16_t recent_sg[8] = {0};
-  int recent_idx = 0;
+  unsigned long last_sample = 0, last_report = 0;
+  uint16_t min_sg = 1023, max_sg = 0, latest = 0;
+  uint32_t sg_sum = 0, sg_count = 0, read_errors = 0;
 
-  while (millis() - test_start < (unsigned long)(duration * 1000)) {
-    unsigned long now = micros();
+  while (millis() - test_start < (unsigned long)duration * 1000) {
+    unsigned long now = millis();
+    bool settled = steps_done >= stall_blank_steps;
 
-    if (now - last_step >= test_step_delay) {
-      step_motor();
-      last_step = now;
-      step_count++;
-
-      if (step_count >= steps_between_reads) {
-        step_count = 0;
-        uint16_t sg = driver.SG_RESULT();
-
-        if (sg < min_sg) min_sg = sg;
-        if (sg > max_sg) max_sg = sg;
-        sg_sum += sg;
-        sg_count++;
-
-        recent_sg[recent_idx] = sg;
-        recent_idx = (recent_idx + 1) % 8;
-
-        if (sg < (uint16_t)(stall_threshold * 2)) {
-          stall_events++;
-        }
+    if (settled && now - last_sample >= 50) {
+      last_sample = now;
+      uint16_t sg = driver.SG_RESULT();
+      if (driver.CRCerror) {  // failed UART read returns 0; don't count it as load
+        read_errors++;
+        continue;
       }
+      latest = sg;
+      if (latest < min_sg) min_sg = latest;
+      if (latest > max_sg) max_sg = latest;
+      sg_sum += latest;
+      sg_count++;
     }
 
-    unsigned long now_ms = millis();
-    if (now_ms - last_report >= 500) {
-      last_report = now_ms;
-
-      uint32_t recent_sum = 0;
-      for (int i = 0; i < 8; i++) recent_sum += recent_sg[i];
-      uint16_t avg = recent_sum / 8;
-      uint16_t latest = recent_sg[(recent_idx + 7) % 8];
-
-      // Visual load bar: map SG to 0-16 blocks (higher SG = more blocks = lighter load)
-      int blocks = (avg > 0) ? constrain(avg / 40, 0, 16) : 0;
-      char bar[17];
-      for (int i = 0; i < 16; i++) bar[i] = (i < blocks) ? '#' : '.';
-      bar[16] = 0;
-
-      const char* load_label;
-      if (latest < (uint16_t)(stall_threshold * 2)) load_label = "STALL!";
-      else if (avg < 100) load_label = "Heavy";
-      else if (avg < 300) load_label = "Medium";
-      else load_label = "Light";
-
-      output("  Load: %-6s [%s] SG:%d\n", load_label, bar, latest);
+    if (now - last_report >= 500) {
+      last_report = now;
+      if (!settled) {
+        output("  Ramping up...\n");
+      } else {
+        // Visual load bar: higher SG = more blocks = lighter load
+        int blocks = constrain(latest / 40, 0, 16);
+        char bar[17];
+        for (int i = 0; i < 16; i++) bar[i] = (i < blocks) ? '#' : '.';
+        bar[16] = 0;
+        output("  SG:%4d [%s] stalled full steps:%lu score:%d/%d%s\n",
+               latest, bar, stall_fullsteps, stall_score, STALL_CONFIRM,
+               stall_score >= STALL_CONFIRM ? "  STALL!" : "");
+      }
       esp_task_wdt_reset();
     }
-
-    static unsigned long last_loop_yield = 0;
-    unsigned long now_ms2 = millis();
-    if (now_ms2 - last_loop_yield >= 50) {
-      yield();
-      last_loop_yield = now_ms2;
-    }
+    delay(1);
   }
 
   stop_motor();
 
-  // Results
-  uint16_t avg_sg = sg_count > 0 ? (sg_sum / sg_count) : 0;
-
   output("\n=== Results ===\n");
-  output("Average load: %s (SG avg: %d, range: %d-%d)\n",
-         avg_sg < 100 ? "Heavy" : avg_sg < 300 ? "Medium" : "Light",
-         avg_sg, min_sg, max_sg);
-  output("Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
-  output("False stalls during test: %d\n", stall_events);
-
-  if (stall_events > 5) {
-    output("\nProblem: Too many false stalls detected.\n");
-    output("Try:  sensitivity low   (less sensitive, ignores light friction)\n");
-  } else if (stall_events > 0) {
-    output("\nSome false stalls detected. This might cause calibration issues.\n");
-    output("Try:  sensitivity low   if calibration stops too early\n");
-  } else {
-    output("\nNo false stalls. Current sensitivity looks good for calibration.\n");
+  if (sg_count == 0) {
+    output("No samples (test too short for this speed)\n");
+    return;
   }
+  uint16_t avg_sg = sg_sum / sg_count;
+  output("SG_RESULT: avg %d, min %d, max %d (stall line: %d)\n", avg_sg, min_sg, max_sg, stall_line);
+  output("Stalled full steps: %lu, peak score: %d (calibration stops at %d)\n",
+         stall_fullsteps, stall_score_max, STALL_CONFIRM);
+  if (read_errors > 0) {
+    output("UART read errors: %lu (skipped; check PDN_UART wiring if frequent)\n", read_errors);
+  }
+
+  if (stall_score_max >= STALL_CONFIRM) {
+    output("\nWould trigger a FALSE stall during calibration. Lower sensitivity.\n");
+  } else if (stall_fullsteps > 0) {
+    output("\nOccasional stall pulses, filtered out by the confirm logic.\n");
+  } else {
+    output("\nNo stall pulses while running free.\n");
+  }
+
+  // Stall line at ~60% of the lowest free-running SG leaves margin both ways
+  int suggested = constrain(min_sg * 3 / 10, 1, 255);
+  output("Suggested (if the curtain ran freely): sensitivity custom %d\n", suggested);
 
   if (avg_sg < 50) {
     output("\nWarning: Motor is under heavy load even when free.\n");

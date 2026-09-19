@@ -56,7 +56,8 @@ Single-wire half-duplex UART: both RX and TX share the PDN_UART pin. The 1K resi
 - **WiFiManager** — captive portal on first boot or button hold for WiFi provisioning
 - **OTA updates** — ArduinoOTA over port 3232
 - **Motor auto-sleep** — driver disabled after configurable inactivity timeout
-- **Position persistence** — current position written to NVS every 50 steps and on stop
+- **Hardware-timed stepping** — step pulses come from a hardware timer ISR with accel/decel ramps, so WiFi/MQTT activity can't cause step jitter (which StallGuard reads as load)
+- **Position persistence** — current position written to NVS every second while moving and on stop
 - **Structured logging** — four log levels (ERROR/WARN/INFO/DEBUG) with subsystem tags
 - **WiFi reconnection** — automatic reconnect with restart fallback after 30s timeout
 - **TMC2209 error monitoring** — overtemperature and short-circuit detection with automatic driver reset
@@ -176,7 +177,7 @@ Connect to `http://<device-ip>/webserial` or open a serial monitor at 115200 bau
 | Command | Description |
 |---------|-------------|
 | `calibrate` | Run sensorless calibration — finds closed and open endpoints automatically |
-| `motortest [sec]` | Run motor under load for N seconds (default 5) and report StallGuard values with a live load bar |
+| `motortest [sec]` | Run motor for N seconds (default 5) using the same stall detector as calibration; reports SG_RESULT range, stall score, and a suggested `sensitivity custom N` |
 
 ### Diagnostics
 
@@ -257,17 +258,25 @@ StallGuard4 reports a motor load value (`SG_RESULT`, 0–1023). A stall is detec
 | `high` | 60 | 120 |
 | `max` | 100 | 200 |
 
+### How a stall is detected
+
+- The step ISR samples DIAG once per full step (the rate StallGuard updates). A full step counts as stalled if DIAG pulsed since the last sample or is still high.
+- A leaky score goes +1 per stalled full step and −1 per clean one; a stall is confirmed at **4**. Isolated spikes decay away; a real stall accumulates.
+- Detection is blanked during the accel ramp (~300 ms) plus 200 ms at cruise speed, while StealthChop's current regulation settles and SG_RESULT is meaningless.
+
 Higher sensitivity catches lighter stalls (useful for lightweight curtains or lower current settings). Lower sensitivity ignores friction and minor resistance (useful for heavier curtains or if calibration stops prematurely).
 
 The `sensitivity_name()` reverse-mapping uses boundary thresholds: ≤8 → `extra_low`, ≤20 → `low`, ≤45 → `medium`, ≤80 → `high`, ≤120 → `max`.
 
 **Tuning workflow:**
 
-1. Run `motortest 10` with the curtain free to move. Observe the live load bar and SG values.
-2. Manually apply resistance to the shaft and confirm `STALL!` appears.
-3. If you see false stalls during free movement, use `sensitivity low` or `sensitivity extra_low`.
-4. If calibration stops before reaching the end, also try a lower sensitivity level.
+1. Run `motortest 10` with the curtain free to move (away from the ends). Watch the SG values and stall score.
+2. Apply the suggested `sensitivity custom N` from the results (puts the stall line at ~60% of the lowest free-running SG).
+3. Re-run `motortest` and apply resistance to the shaft; confirm `STALL!` appears.
+4. If calibration stops before reaching the end, lower the sensitivity. If it grinds at the end without stopping, raise it.
 5. Run `calibrate` once the sensitivity is correct.
+
+SG_RESULT depends on speed and current, so re-run `motortest` after changing `speed`, `current`, or `microsteps`.
 
 During normal movement (non-calibration), stall events are logged in verbose mode but do not stop the motor. Stall detection only drives calibration endpoint detection.
 
@@ -278,10 +287,12 @@ During normal movement (non-calibration), stall events are logged in verbose mod
 Calibration uses StallGuard4 to find the mechanical travel limits without end-stop switches:
 
 1. The motor drives toward the closed (minimum) position until a stall is detected.
-2. The motor backs off 30 steps. This backed-off position is set as position 0 — the precise safe closed boundary.
+2. The motor backs off 15 full steps (30 steps at the default 2 microsteps). This backed-off position is set as position 0 — the precise safe closed boundary.
 3. The motor drives toward the open (maximum) position until a second stall is detected.
-4. The motor backs off 30 steps from the open wall. The usable travel range is the total steps driven minus this open back-off.
+4. The motor backs off 15 full steps from the open wall. The usable travel range is the total steps driven minus this open back-off.
 5. The resulting travel range (in steps) is saved to NVS and HA discovery is re-published.
+
+If the measured travel is implausibly short (under 4× the back-off), calibration aborts instead of saving — that's almost always a false stall.
 
 Both back-off margins are accounted for in the stored `steps_per_revolution` so position 0% and 100% reliably stop before the mechanical limits.
 
