@@ -86,6 +86,24 @@ The ESP32-C3 Arduino core (espressif/arduino-esp32) is required. Install via the
 
 ## Build
 
+### Flash from your browser (no toolchain)
+
+Open **https://bri-j-c.github.io/CurtainController_TMC2209/**, plug the board in over USB and click
+**Connect & Flash**. Chrome or Edge on a desktop only — Firefox and Safari can't access serial ports.
+This writes the whole flash, so saved WiFi and settings are erased.
+
+### Optional: larger app partitions
+
+`partitions.csv` in the sketch folder replaces the stock layout (1.25 MB per OTA slot plus 1.5 MB of
+unused SPIFFS) with 1.9 MB per OTA slot. The firmware fits either way — 98% full on the stock layout,
+65% with this one — so it's optional, but it leaves room to grow.
+
+- Arduino CLI picks the file up automatically; add `--build-property upload.maximum_size=1966080` so the
+  size check uses the bigger slot.
+- **A partition change only applies over USB.** OTA writes into the existing slot and can't relayout flash.
+- Settings survive: the NVS region keeps the same address.
+- To skip it, delete `partitions.csv` and keep builds under 1.25 MB.
+
 ### Arduino CLI
 
 ```bash
@@ -95,6 +113,7 @@ arduino-cli core install esp32:esp32
 # Compile
 arduino-cli compile \
   --fqbn esp32:esp32:nologo_esp32c3_super_mini \
+  --build-property upload.maximum_size=1966080 \
   CurtainController_TMC2209
 
 # Upload (replace /dev/ttyUSB0 with your port)
