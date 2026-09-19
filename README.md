@@ -2,7 +2,7 @@
 
 ESP32-C3 based smart curtain controller with TMC2209 stepper driver, UART control, StallGuard4 sensorless homing, and Home Assistant integration via MQTT.
 
-**Firmware version: v5.3**
+**Firmware version: v5.4**
 
 ---
 

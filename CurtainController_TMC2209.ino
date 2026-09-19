@@ -1,12 +1,12 @@
 // ============================================================================
-// CURTAIN CONTROLLER v5.3 - TMC2209 Edition
+// CURTAIN CONTROLLER v5.4 - TMC2209 Edition
 // Based on original v4.3 with TMC2209 UART control added
 // ============================================================================
 // Target: ESP32-C3 Super Mini
 // Driver: TMC2209 with UART control and StallGuard4
 // ============================================================================
 
-#define FW_VERSION "5.3"
+#define FW_VERSION "5.4"
 
 #include <esp_netif.h>
 #include <WiFi.h>
