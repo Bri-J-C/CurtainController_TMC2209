@@ -1,13 +1,16 @@
 {
   "name": "Curtain Controller (TMC2209)",
-  "version": "5.3",
+  "version": "5.4",
   "home_assistant_domain": "mqtt",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-C3",
       "parts": [
-        { "path": "firmware-merged.bin", "offset": 0 }
+        {
+          "path": "https://github.com/Bri-J-C/CurtainController_TMC2209/releases/download/v5.4/firmware-merged.bin",
+          "offset": 0
+        }
       ]
     }
   ]
