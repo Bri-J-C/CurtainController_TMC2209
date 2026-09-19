@@ -86,11 +86,19 @@ The ESP32-C3 Arduino core (espressif/arduino-esp32) is required. Install via the
 
 ## Build
 
-### Flash from your browser (no toolchain)
+### Flash a prebuilt binary
 
-Open **https://bri-j-c.github.io/CurtainController_TMC2209/**, plug the board in over USB and click
-**Connect & Flash**. Chrome or Edge on a desktop only — Firefox and Safari can't access serial ports.
-This writes the whole flash, so saved WiFi and settings are erased.
+Download `firmware-merged.bin` from the
+[latest release](https://github.com/Bri-J-C/CurtainController_TMC2209/releases/latest) and write it
+over USB:
+
+```bash
+esptool --chip esp32c3 -p /dev/ttyUSB0 write-flash 0x0 firmware-merged.bin
+```
+
+The merged image contains the bootloader, partition table and firmware, and includes the larger app
+partition layout below. It writes the whole flash, so saved WiFi credentials and settings are erased.
+To keep existing settings, build from source and upload over OTA instead.
 
 ### Optional: larger app partitions
 
