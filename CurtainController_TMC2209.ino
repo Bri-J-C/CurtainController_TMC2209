@@ -842,7 +842,8 @@ void publish_status(const char* status) {
 
 void publish_position() {
   if (client.connected()) {
-    int percentage = (current_position * 100) / travel_steps;
+    int percentage = travel_steps > 0 ? (current_position * 100) / travel_steps : 0;
+    percentage = constrain(percentage, 0, 100);
     char pos_str[8];
     snprintf(pos_str, sizeof(pos_str), "%d", percentage);
     client.publish(mqtt_position_topic.c_str(), pos_str, true);
@@ -1590,7 +1591,8 @@ void cmd_motortest(const String& param) {
 
   wake_motor();
   motor_test_active = true;
-  step_start(1, STEPS_UNLIMITED, false);  // count stalls without stopping
+  int position_before = current_position;  // a test must not move the coordinate system
+  step_start(1, STEPS_UNLIMITED, false);   // count stalls without stopping
 
   unsigned long test_start = millis();
   unsigned long last_sample = 0, last_report = 0;
@@ -1669,6 +1671,9 @@ void cmd_motortest(const String& param) {
 
   stop_motor();
   motor_test_active = false;
+  current_position = position_before;
+  save_position();
+  publish_position();
 
   output("\n=== Results ===\n");
   if (free_count == 0) {
