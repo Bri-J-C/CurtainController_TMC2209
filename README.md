@@ -16,6 +16,10 @@ ESP32-C3 based smart curtain controller with TMC2209 stepper driver, UART contro
 
 ### Pin Assignment
 
+Two wiring profiles ship in the firmware, selectable on the setup page along with fully custom
+assignments. The `current` profile is below; `legacy` (STEP 10, DIR 6, EN 0, DIAG 7, TX 21, RX 20)
+matches boards built to the original layout.
+
 | Function | GPIO | Notes |
 |----------|------|-------|
 | STEP | 6 | Step pulse output |
@@ -175,7 +179,7 @@ Holding at boot for 3+ seconds also forces the config portal to open immediately
 | URL | Purpose |
 |-----|---------|
 | `http://<device-ip>/` | Redirects to `/setup` |
-| `http://<device-ip>/setup` | Configure hostname, MQTT, and motor parameters. Dropdowns for microsteps and stall sensitivity. Saves to NVS and reboots. Console button links to WebSerial. |
+| `http://<device-ip>/setup` | Tabbed configuration — Network, Motor, System. Includes the wiring profile and per-pin GPIO assignment, which are deliberately not exposed over MQTT or the console. Saves to NVS and reboots. |
 | `http://<device-ip>/webserial` | Browser-based serial console. Full command interface. |
 
 The setup page uses a dark theme with cyan-purple gradient styling. The device also registers via mDNS as `<hostname>.local` (HTTP and Arduino OTA services).
@@ -203,7 +207,7 @@ Connect to `http://<device-ip>/webserial` or open a serial monitor at 115200 bau
 | `current <mA>` | RMS motor current (100–2000 mA). Default: 800 |
 | `microsteps <n>` | Microstep resolution (1, 2, 4, 8, 16, 32, 64, 128, 256). Default: 16. Position and travel range are rescaled with it, and shaft speed is held constant |
 | `sensitivity <level>` | Stall sensitivity: `extra_low`, `low`, `medium`, `high`, `max`, or `custom <0-255>` |
-| `backoff <n>` | Full steps kept clear of each mechanical end after calibration. Default: 15 |
+| `backoff [end n]` | Show both end clearances, or set one: `backoff open 300`, `backoff close 20`. Default: 15 each |
 | `invert` | Toggle open/close direction (persisted to NVS) |
 | `sleep <ms>` | Motor idle timeout in ms before driver disables (0 = never). Default: 30000 |
 | `travelsteps <n>` | Override total travel range in steps (1–500000) |
@@ -252,8 +256,10 @@ All topics are derived from the configured MQTT root topic (default: `home/room/
 | `<root>/speed_rpm/state` | Publish | integer | Current shaft speed |
 | `<root>/current/set` | Subscribe | `100`–`2000` | Set motor current (mA) |
 | `<root>/current/state` | Publish | integer | Current motor current |
-| `<root>/backoff/set` | Subscribe | `1`–`500` | Set the end back-off (full steps) |
-| `<root>/backoff/state` | Publish | integer | Current end back-off |
+| `<root>/backoff_close/set` | Subscribe | `1`–`2000` | Set the closed-end clearance (full steps) |
+| `<root>/backoff_close/state` | Publish | integer | Current closed-end clearance |
+| `<root>/backoff_open/set` | Subscribe | `1`–`2000` | Set the open-end clearance (full steps) |
+| `<root>/backoff_open/state` | Publish | integer | Current open-end clearance |
 | `<root>/stallthreshold/set` | Subscribe | `extra_low` / `low` / `medium` / `high` / `max` | Set stall sensitivity |
 | `<root>/stallthreshold/state` | Publish | sensitivity name | Current stall sensitivity |
 | `<root>/microsteps/set` | Subscribe | `1`–`256` | Set microstep resolution |
@@ -279,7 +285,8 @@ The device publishes MQTT auto-discovery payloads on first connect (and on `hadi
 | Motor Current | `number` (100–2000 mA, step 100) | RMS current limit |
 | Stall Sensitivity | `select` (extra_low / low / medium / high / max) | StallGuard sensitivity preset |
 | Microsteps | `select` (1–256, powers of 2) | Microstep resolution |
-| End Back-off | `number` (1–500 full steps, step 5) | Margin kept clear of each mechanical end |
+| Back-off Close | `number` (1–2000 full steps, step 5) | Clearance kept at the closed end |
+| Back-off Open | `number` (1–2000 full steps, step 5) | Clearance kept at the open end |
 | Invert Direction | `switch` | Swap open/close direction |
 
 The cover entity uses `set_position_topic` pointing to the command topic, so HA position slider commands send a bare percentage number directly.

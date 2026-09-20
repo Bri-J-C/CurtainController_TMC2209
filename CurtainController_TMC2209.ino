@@ -35,12 +35,27 @@ const int WDT_TIMEOUT = 180;  // 3 minutes
 // Pin definitions for TMC2209 - ESP32-C3 SUPER MINI
 // Safe pins: GPIO 0,1,3,4,5,6,7,10,20,21
 // Avoid at boot: GPIO 2,8,9 (strapping pins)
-const int STEP_PIN = 6;
-const int DIR_PIN = 5;
-const int ENABLE_PIN = 20;
-const int DIAG_PIN = 21;
-const int TMC_TX_PIN = 7;
-const int TMC_RX_PIN = 10;
+// Two wiring generations exist. Boards built to the original layout keep
+// working by selecting the legacy profile; the pins are read at boot.
+struct PinProfile {
+  const char* name;
+  int step, dir, enable, diag, tx, rx;
+};
+const PinProfile PIN_PROFILES[] = {
+  {"current", 6, 5, 20, 21, 7, 10},
+  {"legacy", 10, 6, 0, 7, 21, 20},
+};
+const int PIN_PROFILE_COUNT = sizeof(PIN_PROFILES) / sizeof(PIN_PROFILES[0]);
+
+const uint8_t PIN_PROFILE_CUSTOM = 250;
+uint8_t pin_profile = 0;
+int STEP_PIN = 6;
+int DIR_PIN = 5;
+int ENABLE_PIN = 20;
+int DIAG_PIN = 21;
+int TMC_TX_PIN = 7;
+int TMC_RX_PIN = 10;
+
 const int STATUS_LED = 8;
 const int RESET_BUTTON_PIN = 9;
 
@@ -138,8 +153,10 @@ String mqtt_speed_set_topic;
 String mqtt_speed_state_topic;
 String mqtt_current_set_topic;
 String mqtt_current_state_topic;
-String mqtt_backoff_set_topic;
-String mqtt_backoff_state_topic;
+String mqtt_backoff_close_set_topic;
+String mqtt_backoff_close_state_topic;
+String mqtt_backoff_open_set_topic;
+String mqtt_backoff_open_state_topic;
 String mqtt_stallthreshold_set_topic;
 String mqtt_stallthreshold_state_topic;
 String mqtt_microsteps_set_topic;
@@ -321,6 +338,41 @@ void buf_printf(String& out, const char* fmt, ...) {
   out += buf;
 }
 
+// GPIO 8 and 9 drive the LED and button; 11-17 are wired to flash
+bool valid_motor_gpio(int pin) {
+  if (pin < 0 || pin > 21) return false;
+  if (pin == 8 || pin == 9) return false;
+  if (pin >= 11 && pin <= 17) return false;
+  return true;
+}
+
+const char* pin_profile_name() {
+  return pin_profile == PIN_PROFILE_CUSTOM ? "custom" : PIN_PROFILES[pin_profile].name;
+}
+
+void apply_pin_profile(uint8_t index) {
+  if (index == PIN_PROFILE_CUSTOM) {
+    pin_profile = index;
+    STEP_PIN = preferences.getInt("pin_step", PIN_PROFILES[0].step);
+    DIR_PIN = preferences.getInt("pin_dir", PIN_PROFILES[0].dir);
+    ENABLE_PIN = preferences.getInt("pin_en", PIN_PROFILES[0].enable);
+    DIAG_PIN = preferences.getInt("pin_diag", PIN_PROFILES[0].diag);
+    TMC_TX_PIN = preferences.getInt("pin_tx", PIN_PROFILES[0].tx);
+    TMC_RX_PIN = preferences.getInt("pin_rx", PIN_PROFILES[0].rx);
+    return;
+  }
+
+  if (index >= PIN_PROFILE_COUNT) index = 0;
+  pin_profile = index;
+  const PinProfile& p = PIN_PROFILES[index];
+  STEP_PIN = p.step;
+  DIR_PIN = p.dir;
+  ENABLE_PIN = p.enable;
+  DIAG_PIN = p.diag;
+  TMC_TX_PIN = p.tx;
+  TMC_RX_PIN = p.rx;
+}
+
 // ============================================================================
 // STEP GENERATOR + STALLGUARD
 // ============================================================================
@@ -334,7 +386,8 @@ const uint32_t RAMP_TIME_US = 300000;    // accel/decel ramp duration
 const uint32_t STALL_BLANK_US = 200000;  // StallGuard ignored this long after the ramp completes
 const uint8_t STALL_CONFIRM = 6;         // score confirming a stall
 const uint8_t STALL_HIT_WEIGHT = 2;      // score added per stalled full step, 1 subtracted per clean one
-int cal_backoff_fullsteps = 15;          // margin kept clear of each mechanical end
+int cal_backoff_close = 15;              // margin kept clear of the closed end
+int cal_backoff_open = 15;               // margin kept clear of the open end
 
 hw_timer_t* step_timer = nullptr;
 bool step_timer_on = false;
@@ -785,20 +838,21 @@ void handle_calibration() {
   last_motor_activity = millis();
   if (step_running) return;
 
-  const int backoff = cal_backoff_fullsteps * motor_microsteps;
+  const int backoff_close = cal_backoff_close * motor_microsteps;
+  const int backoff_open = cal_backoff_open * motor_microsteps;
 
   switch (cal_state) {
     case CAL_FIND_MIN:
       log_msg(LOG_INFO, "CAL", "Found closed boundary: stall confirmed after %lu steps (score %d/%d; %lu flagged full steps this run)",
               steps_done, STALL_CONFIRM, STALL_CONFIRM, stall_fullsteps);
-      step_start(1, backoff, false);
+      step_start(1, backoff_close, false);
       cal_state = CAL_BACKOFF_MIN;
       break;
 
     case CAL_BACKOFF_MIN:
       current_position = 0;  // This backed-off spot IS position 0
       save_position();
-      log_msg(LOG_INFO, "CAL", "Backed off %d steps, set as position 0. Finding open position...", backoff);
+      log_msg(LOG_INFO, "CAL", "Backed off %d steps, set as position 0. Finding open position...", backoff_close);
       step_start(1, STEPS_UNLIMITED, true);
       cal_state = CAL_FIND_MAX;
       break;
@@ -806,11 +860,11 @@ void handle_calibration() {
     case CAL_FIND_MAX:
       log_msg(LOG_INFO, "CAL", "Found open boundary at %d steps from safe-close: stall confirmed (score %d/%d; %lu flagged full steps this run)",
               current_position, STALL_CONFIRM, STALL_CONFIRM, stall_fullsteps);
-      if (current_position < 4 * backoff) {
+      if (current_position < 4 * backoff_close) {
         abort_calibration("travel too short, likely a false stall (try lower sensitivity, run motortest)");
         return;
       }
-      step_start(-1, backoff, false);
+      step_start(-1, backoff_open, false);
       cal_state = CAL_BACKOFF_MAX;
       break;
 
@@ -819,8 +873,8 @@ void handle_calibration() {
       travel_steps = current_position;
       preferences.putInt("steps_per_rev", travel_steps);
       save_position();
-      log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps, %d full steps clear of each end",
-              travel_steps, cal_backoff_fullsteps);
+      log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps, clear by %d closed / %d open full steps",
+              travel_steps, cal_backoff_close, cal_backoff_open);
       cal_state = CAL_IDLE;
       is_moving = false;
       publish_position();
@@ -1073,17 +1127,19 @@ void publish_ha_discovery(bool force) {
     client.publish(topic.c_str(), json.c_str(), true);
   }
 
-  // Calibration back-off number entity
-  {
-    String topic = "homeassistant/number/" + device_hostname + "_backoff/config";
+  // Calibration back-off number entities, one per end
+  for (int end = 0; end < 2; end++) {
+    bool is_open = end == 1;
+    String key = is_open ? "backoff_open" : "backoff_close";
+    String topic = "homeassistant/number/" + device_hostname + "_" + key + "/config";
     StaticJsonDocument<512> doc;
-    doc["name"] = "End Back-off";
-    doc["unique_id"] = "curtain_" + device_hostname + "_backoff";
-    doc["object_id"] = device_hostname + "_backoff";
-    doc["command_topic"] = mqtt_backoff_set_topic;
-    doc["state_topic"] = mqtt_backoff_state_topic;
+    doc["name"] = is_open ? "Back-off Open" : "Back-off Close";
+    doc["unique_id"] = "curtain_" + device_hostname + "_" + key;
+    doc["object_id"] = device_hostname + "_" + key;
+    doc["command_topic"] = is_open ? mqtt_backoff_open_set_topic : mqtt_backoff_close_set_topic;
+    doc["state_topic"] = is_open ? mqtt_backoff_open_state_topic : mqtt_backoff_close_state_topic;
     doc["min"] = 1;
-    doc["max"] = 500;
+    doc["max"] = 2000;
     doc["step"] = 5;
     doc["unit_of_measurement"] = "full steps";
     doc["icon"] = "mdi:arrow-collapse-horizontal";
@@ -1105,6 +1161,8 @@ void publish_ha_discovery(bool force) {
   client.publish(old_topic.c_str(), "", true);
   old_topic = "homeassistant/number/" + device_hostname + "_speed/config";
   client.publish(old_topic.c_str(), "", true);
+  old_topic = "homeassistant/number/" + device_hostname + "_backoff/config";
+  client.publish(old_topic.c_str(), "", true);
 
   log_msg(LOG_INFO, "MQTT", "HA settings entities published");
 }
@@ -1116,8 +1174,10 @@ void publish_settings_state() {
   client.publish(mqtt_speed_state_topic.c_str(), buf, true);
   snprintf(buf, sizeof(buf), "%d", motor_current_ma);
   client.publish(mqtt_current_state_topic.c_str(), buf, true);
-  snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
-  client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
+  snprintf(buf, sizeof(buf), "%d", cal_backoff_close);
+  client.publish(mqtt_backoff_close_state_topic.c_str(), buf, true);
+  snprintf(buf, sizeof(buf), "%d", cal_backoff_open);
+  client.publish(mqtt_backoff_open_state_topic.c_str(), buf, true);
   client.publish(mqtt_stallthreshold_state_topic.c_str(), sensitivity_name(stall_threshold), true);
   snprintf(buf, sizeof(buf), "%d", motor_microsteps);
   client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
@@ -1144,15 +1204,20 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     }
     return;
   }
-  if (strcmp(topic, mqtt_backoff_set_topic.c_str()) == 0) {
+  if (strcmp(topic, mqtt_backoff_close_set_topic.c_str()) == 0 ||
+      strcmp(topic, mqtt_backoff_open_set_topic.c_str()) == 0) {
+    bool is_open = strcmp(topic, mqtt_backoff_open_set_topic.c_str()) == 0;
     int value = msg.toInt();
-    if (value >= 1 && value <= 500) {
-      cal_backoff_fullsteps = value;
-      preferences.putInt("cal_backoff", cal_backoff_fullsteps);
-      log_msg(LOG_INFO, "MQTT", "Back-off set to %d full steps", cal_backoff_fullsteps);
-      char buf[16];
-      snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
-      client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
+    if (value >= 1 && value <= 2000) {
+      if (is_open) {
+        cal_backoff_open = value;
+        preferences.putInt("backoff_open", value);
+      } else {
+        cal_backoff_close = value;
+        preferences.putInt("backoff_close", value);
+      }
+      log_msg(LOG_INFO, "MQTT", "%s back-off set to %d full steps", is_open ? "Open" : "Close", value);
+      publish_backoff_state();
     }
     return;
   }
@@ -1268,7 +1333,8 @@ void connect_mqtt() {
     client.subscribe(mqtt_calibrate_topic.c_str());
     client.subscribe(mqtt_speed_set_topic.c_str());
     client.subscribe(mqtt_current_set_topic.c_str());
-    client.subscribe(mqtt_backoff_set_topic.c_str());
+    client.subscribe(mqtt_backoff_close_set_topic.c_str());
+    client.subscribe(mqtt_backoff_open_set_topic.c_str());
     client.subscribe(mqtt_stallthreshold_set_topic.c_str());
     client.subscribe(mqtt_microsteps_set_topic.c_str());
     client.subscribe(mqtt_invert_set_topic.c_str());
@@ -1301,8 +1367,10 @@ void setup_mqtt() {
   mqtt_speed_state_topic = mqtt_root_topic + "/speed_rpm/state";
   mqtt_current_set_topic = mqtt_root_topic + "/current/set";
   mqtt_current_state_topic = mqtt_root_topic + "/current/state";
-  mqtt_backoff_set_topic = mqtt_root_topic + "/backoff/set";
-  mqtt_backoff_state_topic = mqtt_root_topic + "/backoff/state";
+  mqtt_backoff_close_set_topic = mqtt_root_topic + "/backoff_close/set";
+  mqtt_backoff_close_state_topic = mqtt_root_topic + "/backoff_close/state";
+  mqtt_backoff_open_set_topic = mqtt_root_topic + "/backoff_open/set";
+  mqtt_backoff_open_state_topic = mqtt_root_topic + "/backoff_open/state";
   mqtt_stallthreshold_set_topic = mqtt_root_topic + "/stallthreshold/set";
   mqtt_stallthreshold_state_topic = mqtt_root_topic + "/stallthreshold/state";
   mqtt_microsteps_set_topic = mqtt_root_topic + "/microsteps/set";
@@ -1410,21 +1478,42 @@ void apply_sensitivity(uint8_t value, const char* label) {
   publish_sensitivity_state();
 }
 
+void publish_backoff_state() {
+  if (!client.connected()) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", cal_backoff_close);
+  client.publish(mqtt_backoff_close_state_topic.c_str(), buf, true);
+  snprintf(buf, sizeof(buf), "%d", cal_backoff_open);
+  client.publish(mqtt_backoff_open_state_topic.c_str(), buf, true);
+}
+
 void cmd_backoff(const String& param) {
-  int value = param.toInt();
-  if (value >= 1 && value <= 500) {
-    cal_backoff_fullsteps = value;
-    preferences.putInt("cal_backoff", cal_backoff_fullsteps);
-    log_msg(LOG_INFO, "NVS", "Calibration back-off set to %d full steps (%d microsteps)",
-            cal_backoff_fullsteps, cal_backoff_fullsteps * motor_microsteps);
-    if (client.connected()) {
-      char buf[16];
-      snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
-      client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
+  String p = param;
+  p.trim();
+  p.toLowerCase();
+
+  int space = p.indexOf(' ');
+  if (space > 0) {
+    String end = p.substring(0, space);
+    int value = p.substring(space + 1).toInt();
+    if (value >= 1 && value <= 2000 && (end == "open" || end == "close")) {
+      if (end == "open") {
+        cal_backoff_open = value;
+        preferences.putInt("backoff_open", value);
+      } else {
+        cal_backoff_close = value;
+        preferences.putInt("backoff_close", value);
+      }
+      log_msg(LOG_INFO, "NVS", "%s back-off set to %d full steps (%d microsteps)",
+              end.c_str(), value, value * motor_microsteps);
+      publish_backoff_state();
+      return;
     }
-  } else {
-    log_msg(LOG_ERROR, "CMD", "backoff: must be 1-500 full steps (got %d)", value);
+    log_msg(LOG_ERROR, "CMD", "backoff: use 'backoff open <1-2000>' or 'backoff close <1-2000>'");
+    return;
   }
+
+  output("Back-off: closed end %d, open end %d full steps\n", cal_backoff_close, cal_backoff_open);
 }
 
 void cmd_sensitivity(const String& param) {
@@ -1521,8 +1610,10 @@ void cmd_config(const String& param) {
   buf_printf(out, "Microsteps: %d\n", motor_microsteps);
   buf_printf(out, "Current: %d mA\n", motor_current_ma);
   buf_printf(out, "Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
-  buf_printf(out, "End back-off: %d full steps (%d microsteps)\n",
-             cal_backoff_fullsteps, cal_backoff_fullsteps * motor_microsteps);
+  buf_printf(out, "Pin profile: %s (STEP:%d DIR:%d EN:%d DIAG:%d TX:%d RX:%d)\n",
+             pin_profile_name(), STEP_PIN, DIR_PIN, ENABLE_PIN, DIAG_PIN,
+             TMC_TX_PIN, TMC_RX_PIN);
+  buf_printf(out, "End back-off: closed %d, open %d full steps\n", cal_backoff_close, cal_backoff_open);
   buf_printf(out, "Travel Steps: %d\n", travel_steps);
   buf_printf(out, "Invert Direction: %s\n", invert_direction ? "YES" : "NO");
   buf_printf(out, "Sleep Timeout: %lu ms\n", motor_sleep_timeout);
@@ -1560,7 +1651,7 @@ void cmd_help(const String& param) {
     "current <mA>      Motor current (100-2000)\n"
     "microsteps <n>    Microsteps (1,2,4,8,16,32,64,128,256)\n"
     "sensitivity <lvl> Stall sensitivity (extra_low|low|medium|high|max|custom N)\n"
-    "backoff <n>       Full steps kept clear of each end after calibration\n"
+    "backoff [end n]   Show, or set 'open'/'close' clearance in full steps\n"
     "invert            Toggle open/close direction\n"
     "sleep <ms>        Motor sleep timeout (0=never)\n"
     "travelsteps <n>   Total travel range in steps\n"
@@ -1997,6 +2088,7 @@ const Command commands[] = {
   {"microsteps ", cmd_microsteps},
   {"current ", cmd_current},
   {"backoff ", cmd_backoff},
+  {"backoff", cmd_backoff},
   {"sensitivity ", cmd_sensitivity},
   {"sensitivity", cmd_sensitivity},
   {"calibrate", cmd_calibrate},
@@ -2094,6 +2186,8 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
     label:first-of-type{margin-top:0}
     input,select{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:14px;font-weight:500;transition:border-color 0.2s}
     input:focus,select:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 3px rgba(0,212,255,0.1)}
+    select{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(135deg,var(--dim) 50%,transparent 50%);background-position:calc(100% - 18px) 50%,calc(100% - 13px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:36px}
+    select option{background:#12122a;color:var(--text)}
     .hint{color:var(--dim);font-size:11px;margin-top:2px}
     .btn-row{display:flex;gap:12px;margin-top:20px}
     .btn{flex:1;padding:14px;font-size:15px;border-radius:12px;border:none;cursor:pointer;font-weight:600;transition:all 0.2s;text-align:center;text-decoration:none}
@@ -2102,6 +2196,14 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
     .btn-secondary{background:var(--card);color:var(--dim);border:1px solid var(--border)}
     .btn-secondary:hover{border-color:var(--cyan);color:var(--text)}
     .version{text-align:center;color:rgba(255,255,255,0.15);font-size:10px;margin-top:16px}
+    .tabs{display:flex;gap:6px;margin-bottom:16px}
+    .tab{flex:1;padding:10px 6px;font-size:13px;font-weight:600;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--dim);cursor:pointer;transition:all 0.2s}
+    .tab:hover{color:var(--text)}
+    .tab.on{background:var(--gradient);color:#fff;border-color:transparent}
+    .panel{display:none}
+    .panel.on{display:block}
+    .pins{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;margin-top:8px}
+    .pins label{margin-top:10px}
   </style>
 </head>
 <body>
@@ -2123,7 +2225,14 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
     </div>
     <div class="subtitle">TMC2209 Edition &middot; %HOSTNAME%</div>
 
+    <div class="tabs">
+      <button type="button" class="tab on" data-panel="network">Network</button>
+      <button type="button" class="tab" data-panel="motor">Motor</button>
+      <button type="button" class="tab" data-panel="system">System</button>
+    </div>
+
     <form action="/save" method="POST">
+      <div class="panel on" id="network">
       <div class="card">
         <h2>Network</h2>
         <label>Hostname</label>
@@ -2141,8 +2250,13 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
         <div class="hint">Creates: /cmd, /status, /position, /availability</div>
       </div>
 
+      </div>
+
+      <div class="panel" id="motor">
       <div class="card">
         <h2>Motor</h2>
+        <label>Speed (RPM)</label>
+        <input name="rpm" type="number" value="%RPM%" min="10" max="300">
         <label>Travel Steps</label>
         <input name="steps" type="number" value="%STEPS%">
         <label>Current (mA)</label>
@@ -2163,13 +2277,38 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
           <option value="60" %SEN_HI%>High (60)</option>
           <option value="100" %SEN_MX%>Max (100)</option>
         </select>
+        <label>Close Back-off (full steps)</label>
+        <input name="backoff_close" type="number" value="%BACKOFF_CLOSE%" min="1" max="2000">
+        <label>Open Back-off (full steps)</label>
+        <input name="backoff_open" type="number" value="%BACKOFF_OPEN%" min="1" max="2000">
+        <div class="hint">Clearance kept at each end. The ends often need different values.</div>
       </div>
 
+      </div>
+
+      <div class="panel" id="system">
       <div class="card">
         <h2>System</h2>
         <label>OTA Password</label>
         <input name="ota_pass" type="password" placeholder="Leave blank to keep current">
+        <label>Wiring Profile</label>
+        <select name="pinprofile" id="pinprofile">
+          <option value="0" %PIN0%>Current</option>
+          <option value="1" %PIN1%>Legacy</option>
+          <option value="250" %PINC%>Custom</option>
+        </select>
+        <div class="hint">Must match how this board is wired. The wrong profile leaves the motor unresponsive.</div>
+        <div class="pins">
+          <div><label>STEP</label><input name="pin_step" id="pin_step" type="number" value="%PIN_STEP%" min="0" max="21"></div>
+          <div><label>DIR</label><input name="pin_dir" id="pin_dir" type="number" value="%PIN_DIR%" min="0" max="21"></div>
+          <div><label>EN</label><input name="pin_en" id="pin_en" type="number" value="%PIN_EN%" min="0" max="21"></div>
+          <div><label>DIAG</label><input name="pin_diag" id="pin_diag" type="number" value="%PIN_DIAG%" min="0" max="21"></div>
+          <div><label>UART TX</label><input name="pin_tx" id="pin_tx" type="number" value="%PIN_TX%" min="0" max="21"></div>
+          <div><label>UART RX</label><input name="pin_rx" id="pin_rx" type="number" value="%PIN_RX%" min="0" max="21"></div>
+        </div>
+        <div class="hint">GPIO 0-7, 10, 18-21. Editing a pin switches the profile to Custom.</div>
         <div class="hint">Device will reboot after saving.</div>
+      </div>
       </div>
 
       <div class="btn-row">
@@ -2177,6 +2316,38 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
         <a href="/webserial" class="btn btn-secondary">Console</a>
       </div>
     </form>
+
+    <script>
+      var PRESETS = {0:[6,5,20,21,7,10], 1:[10,6,0,7,21,20]};
+      var PIN_IDS = ['pin_step','pin_dir','pin_en','pin_diag','pin_tx','pin_rx'];
+      var profileSelect = document.getElementById('pinprofile');
+      profileSelect.onchange = function() {
+        var preset = PRESETS[this.value];
+        if (!preset) return;
+        for (var i = 0; i < PIN_IDS.length; i++) {
+          document.getElementById(PIN_IDS[i]).value = preset[i];
+        }
+      };
+      for (var p = 0; p < PIN_IDS.length; p++) {
+        document.getElementById(PIN_IDS[p]).oninput = function() {
+          profileSelect.value = '250';
+        };
+      }
+
+      var tabs = document.querySelectorAll('.tab');
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].onclick = function() {
+          var target = this.getAttribute('data-panel');
+          for (var j = 0; j < tabs.length; j++) {
+            tabs[j].className = tabs[j] === this ? 'tab on' : 'tab';
+          }
+          var panels = document.querySelectorAll('.panel');
+          for (var k = 0; k < panels.length; k++) {
+            panels[k].className = panels[k].id === target ? 'panel on' : 'panel';
+          }
+        };
+      }
+    </script>
 
     <div class="version">v%VERSION%</div>
   </div>
@@ -2200,6 +2371,18 @@ void setup_webserial() {
     html.replace("%MQTT_USER%", preferences.getString("mqtt_user", "your_mqtt_user"));
     html.replace("%MQTT_PASS%", preferences.getString("mqtt_pass", "your_mqtt_password"));
     html.replace("%MQTT_TOPIC%", preferences.getString("mqtt_root_topic", "home/room/curtains"));
+    html.replace("%RPM%", String(motor_rpm));
+    html.replace("%BACKOFF_CLOSE%", String(cal_backoff_close));
+    html.replace("%BACKOFF_OPEN%", String(cal_backoff_open));
+    html.replace("%PIN0%", pin_profile == 0 ? "selected" : "");
+    html.replace("%PIN1%", pin_profile == 1 ? "selected" : "");
+    html.replace("%PINC%", pin_profile == PIN_PROFILE_CUSTOM ? "selected" : "");
+    html.replace("%PIN_STEP%", String(STEP_PIN));
+    html.replace("%PIN_DIR%", String(DIR_PIN));
+    html.replace("%PIN_EN%", String(ENABLE_PIN));
+    html.replace("%PIN_DIAG%", String(DIAG_PIN));
+    html.replace("%PIN_TX%", String(TMC_TX_PIN));
+    html.replace("%PIN_RX%", String(TMC_RX_PIN));
     html.replace("%STEPS%", String(preferences.getInt("steps_per_rev", 2000)));
     html.replace("%CURRENT%", String(preferences.getUShort("current_ma", 800)));
 
@@ -2263,6 +2446,42 @@ void setup_webserial() {
     if (request->hasParam("steps", true)) {
       int steps = request->getParam("steps", true)->value().toInt();
       if (steps > 0) preferences.putInt("steps_per_rev", steps);
+    }
+    if (request->hasParam("rpm", true)) {
+      int val = request->getParam("rpm", true)->value().toInt();
+      if (val >= 10 && val <= 300) preferences.putInt("rpm", val);
+    }
+    if (request->hasParam("backoff_close", true)) {
+      int val = request->getParam("backoff_close", true)->value().toInt();
+      if (val >= 1 && val <= 2000) preferences.putInt("backoff_close", val);
+    }
+    if (request->hasParam("backoff_open", true)) {
+      int val = request->getParam("backoff_open", true)->value().toInt();
+      if (val >= 1 && val <= 2000) preferences.putInt("backoff_open", val);
+    }
+    if (request->hasParam("pinprofile", true)) {
+      int val = request->getParam("pinprofile", true)->value().toInt();
+      if (val >= 0 && val < PIN_PROFILE_COUNT) {
+        preferences.putUChar("pin_profile", val);
+      } else if (val == PIN_PROFILE_CUSTOM) {
+        const char* fields[] = {"pin_step", "pin_dir", "pin_en", "pin_diag", "pin_tx", "pin_rx"};
+        int pins[6];
+        bool ok = true;
+        for (int i = 0; i < 6 && ok; i++) {
+          if (!request->hasParam(fields[i], true)) { ok = false; break; }
+          pins[i] = request->getParam(fields[i], true)->value().toInt();
+          if (!valid_motor_gpio(pins[i])) ok = false;
+          for (int j = 0; j < i; j++) {
+            if (pins[j] == pins[i]) ok = false;  // two functions on one pin
+          }
+        }
+        if (ok) {
+          for (int i = 0; i < 6; i++) preferences.putInt(fields[i], pins[i]);
+          preferences.putUChar("pin_profile", PIN_PROFILE_CUSTOM);
+        } else {
+          log_msg(LOG_ERROR, "SYS", "Rejected custom pins: invalid GPIO or duplicate");
+        }
+      }
     }
     if (request->hasParam("current", true)) {
       int val = request->getParam("current", true)->value().toInt();
@@ -2661,6 +2880,8 @@ void setup() {
 
   log_msg(LOG_INFO, "BOOT", "Reset reason: %s", reason_str);
 
+  apply_pin_profile(preferences.getUChar("pin_profile", 0));
+
   current_position = preferences.getInt("position", 0);
   motor_rpm = preferences.getInt("rpm", 0);
   motor_sleep_timeout = preferences.getULong("sleep_timeout", 30000);
@@ -2680,7 +2901,9 @@ void setup() {
   }
   motor_microsteps = preferences.getUShort("microsteps", 16);
   stall_threshold = preferences.getUChar("stall_thr", 50);
-  cal_backoff_fullsteps = preferences.getInt("cal_backoff", 15);
+  int legacy_backoff = preferences.getInt("cal_backoff", 15);
+  cal_backoff_close = preferences.getInt("backoff_close", legacy_backoff);
+  cal_backoff_open = preferences.getInt("backoff_open", legacy_backoff);
   invert_direction = preferences.getBool("invert_dir", false);
 
   // Speed used to be stored as a step interval; convert it once so existing
