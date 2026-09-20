@@ -257,13 +257,40 @@ function add(t){
   while(log.childElementCount>800)log.removeChild(log.firstChild);
   if(atEnd)log.scrollTop=log.scrollHeight;
 }
-function connect(){
-  ws=new WebSocket('ws://'+location.host+'/webserialws');
-  ws.onopen=function(){dot.className='on';state.textContent='connected'};
-  ws.onclose=function(){dot.className='';state.textContent='reconnecting';setTimeout(connect,2000)};
-  ws.onerror=function(){ws.close()};
-  ws.onmessage=function(e){if(e.data)add(e.data)};
+var retry=0,timer=null,connTO=null,pongTO=null;
+function drop(){try{ws.close()}catch(e){}}
+function schedule(){
+  if(timer)return;
+  var delay=Math.min(1000*(retry+1),5000);retry++;
+  dot.className='';state.textContent='reconnecting';
+  timer=setTimeout(function(){timer=null;connect()},delay);
 }
+function connect(){
+  clearTimeout(connTO);clearTimeout(pongTO);pongTO=null;
+  dot.className='';state.textContent='connecting';
+  try{ws=new WebSocket('ws://'+location.host+'/webserialws')}catch(e){schedule();return}
+  connTO=setTimeout(drop,3000);
+  ws.onopen=function(){clearTimeout(connTO);dot.className='on';state.textContent='connected';retry=0};
+  ws.onclose=function(){clearTimeout(connTO);clearTimeout(pongTO);pongTO=null;schedule()};
+  ws.onerror=function(){drop()};
+  ws.onmessage=function(e){
+    if(e.data=='pong'){clearTimeout(pongTO);pongTO=null;return}
+    if(e.data)add(e.data);
+  };
+}
+// A rebooting device does not close the socket, so the browser can sit on a
+// dead connection. Nothing arriving for 20s means it is gone.
+// An idle console is silent, so silence proves nothing. A ping the device
+// answers does: no pong means the link is gone, whatever the socket claims.
+setInterval(function(){
+  if(!ws||ws.readyState>1){schedule();return}
+  if(ws.readyState!=1||pongTO)return;
+  try{ws.send('ping')}catch(e){drop();return}
+  pongTO=setTimeout(function(){pongTO=null;state.textContent='no response';drop()},4000);
+},5000);
+document.addEventListener('visibilitychange',function(){
+  if(!document.hidden&&(!ws||ws.readyState>1))connect();
+});
 connect();
 document.getElementById('f').onsubmit=function(e){
   e.preventDefault();var i=document.getElementById('c'),v=i.value.trim();
@@ -2406,7 +2433,9 @@ void setup_webserial() {
     html.replace("%SEN_HI%", (st > 45 && st <= 80) ? "selected" : "");
     html.replace("%SEN_MX%", st > 80 ? "selected" : "");
 
-    request->send(200, "text/html", html);
+    AsyncWebServerResponse* response = request->beginResponse(200, "text/html", html);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2521,12 +2550,20 @@ void setup_webserial() {
     while (out > 0 && ws_pending_command[out - 1] == ' ') out--;
     ws_pending_command[out] = 0;
     if (out == 0) return;
+
+    if (strcmp(ws_pending_command, "ping") == 0) {
+      client->text("pong");
+      ws_pending_command[0] = 0;
+      return;
+    }
     ws_command_pending = true;
   });
   server.addHandler(&console_ws);
 
   server.on("/webserial", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(200, "text/html", CONSOLE_HTML);
+    AsyncWebServerResponse* response = request->beginResponse(200, "text/html", CONSOLE_HTML);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
   server.begin();
 }
@@ -2989,6 +3026,7 @@ void loop() {
   if (millis() - last_ws_cleanup > 5000) {
     last_ws_cleanup = millis();
     console_ws.cleanupClients();
+
   }
 
   // Periodic TMC error check (every 5 seconds when idle)
