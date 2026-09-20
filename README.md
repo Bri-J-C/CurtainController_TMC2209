@@ -252,6 +252,8 @@ All topics are derived from the configured MQTT root topic (default: `home/room/
 | `<root>/speed_rpm/state` | Publish | integer | Current shaft speed |
 | `<root>/current/set` | Subscribe | `100`–`2000` | Set motor current (mA) |
 | `<root>/current/state` | Publish | integer | Current motor current |
+| `<root>/backoff/set` | Subscribe | `1`–`500` | Set the end back-off (full steps) |
+| `<root>/backoff/state` | Publish | integer | Current end back-off |
 | `<root>/stallthreshold/set` | Subscribe | `extra_low` / `low` / `medium` / `high` / `max` | Set stall sensitivity |
 | `<root>/stallthreshold/state` | Publish | sensitivity name | Current stall sensitivity |
 | `<root>/microsteps/set` | Subscribe | `1`–`256` | Set microstep resolution |
@@ -277,6 +279,7 @@ The device publishes MQTT auto-discovery payloads on first connect (and on `hadi
 | Motor Current | `number` (100–2000 mA, step 100) | RMS current limit |
 | Stall Sensitivity | `select` (extra_low / low / medium / high / max) | StallGuard sensitivity preset |
 | Microsteps | `select` (1–256, powers of 2) | Microstep resolution |
+| End Back-off | `number` (1–500 full steps, step 5) | Margin kept clear of each mechanical end |
 | Invert Direction | `switch` | Swap open/close direction |
 
 The cover entity uses `set_position_topic` pointing to the command topic, so HA position slider commands send a bare percentage number directly.

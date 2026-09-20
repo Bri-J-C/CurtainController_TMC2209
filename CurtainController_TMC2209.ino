@@ -138,6 +138,8 @@ String mqtt_speed_set_topic;
 String mqtt_speed_state_topic;
 String mqtt_current_set_topic;
 String mqtt_current_state_topic;
+String mqtt_backoff_set_topic;
+String mqtt_backoff_state_topic;
 String mqtt_stallthreshold_set_topic;
 String mqtt_stallthreshold_state_topic;
 String mqtt_microsteps_set_topic;
@@ -1065,6 +1067,33 @@ void publish_ha_discovery(bool force) {
     client.publish(topic.c_str(), json.c_str(), true);
   }
 
+  // Calibration back-off number entity
+  {
+    String topic = "homeassistant/number/" + device_hostname + "_backoff/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = "End Back-off";
+    doc["unique_id"] = "curtain_" + device_hostname + "_backoff";
+    doc["object_id"] = device_hostname + "_backoff";
+    doc["command_topic"] = mqtt_backoff_set_topic;
+    doc["state_topic"] = mqtt_backoff_state_topic;
+    doc["min"] = 1;
+    doc["max"] = 500;
+    doc["step"] = 5;
+    doc["unit_of_measurement"] = "full steps";
+    doc["icon"] = "mdi:arrow-collapse-horizontal";
+    doc["entity_category"] = "config";
+    doc["availability_topic"] = mqtt_availability_topic;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc.createNestedObject("device");
+    JsonArray ids = dev.createNestedArray("identifiers");
+    ids.add("curtain_" + WiFi.macAddress());
+    dev["name"] = device_hostname;
+    String json;
+    serializeJson(doc, json);
+    client.publish(topic.c_str(), json.c_str(), true);
+  }
+
   // Remove entities replaced by newer ones
   String old_topic = "homeassistant/number/" + device_hostname + "_stallthreshold/config";
   client.publish(old_topic.c_str(), "", true);
@@ -1081,6 +1110,8 @@ void publish_settings_state() {
   client.publish(mqtt_speed_state_topic.c_str(), buf, true);
   snprintf(buf, sizeof(buf), "%d", motor_current_ma);
   client.publish(mqtt_current_state_topic.c_str(), buf, true);
+  snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
+  client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
   client.publish(mqtt_stallthreshold_state_topic.c_str(), sensitivity_name(stall_threshold), true);
   snprintf(buf, sizeof(buf), "%d", motor_microsteps);
   client.publish(mqtt_microsteps_state_topic.c_str(), buf, true);
@@ -1104,6 +1135,18 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       char buf[16];
       snprintf(buf, sizeof(buf), "%d", motor_rpm);
       client.publish(mqtt_speed_state_topic.c_str(), buf, true);
+    }
+    return;
+  }
+  if (strcmp(topic, mqtt_backoff_set_topic.c_str()) == 0) {
+    int value = msg.toInt();
+    if (value >= 1 && value <= 500) {
+      cal_backoff_fullsteps = value;
+      preferences.putInt("cal_backoff", cal_backoff_fullsteps);
+      log_msg(LOG_INFO, "MQTT", "Back-off set to %d full steps", cal_backoff_fullsteps);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
+      client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
     }
     return;
   }
@@ -1219,6 +1262,7 @@ void connect_mqtt() {
     client.subscribe(mqtt_calibrate_topic.c_str());
     client.subscribe(mqtt_speed_set_topic.c_str());
     client.subscribe(mqtt_current_set_topic.c_str());
+    client.subscribe(mqtt_backoff_set_topic.c_str());
     client.subscribe(mqtt_stallthreshold_set_topic.c_str());
     client.subscribe(mqtt_microsteps_set_topic.c_str());
     client.subscribe(mqtt_invert_set_topic.c_str());
@@ -1251,6 +1295,8 @@ void setup_mqtt() {
   mqtt_speed_state_topic = mqtt_root_topic + "/speed_rpm/state";
   mqtt_current_set_topic = mqtt_root_topic + "/current/set";
   mqtt_current_state_topic = mqtt_root_topic + "/current/state";
+  mqtt_backoff_set_topic = mqtt_root_topic + "/backoff/set";
+  mqtt_backoff_state_topic = mqtt_root_topic + "/backoff/state";
   mqtt_stallthreshold_set_topic = mqtt_root_topic + "/stallthreshold/set";
   mqtt_stallthreshold_state_topic = mqtt_root_topic + "/stallthreshold/state";
   mqtt_microsteps_set_topic = mqtt_root_topic + "/microsteps/set";
@@ -1365,6 +1411,11 @@ void cmd_backoff(const String& param) {
     preferences.putInt("cal_backoff", cal_backoff_fullsteps);
     log_msg(LOG_INFO, "NVS", "Calibration back-off set to %d full steps (%d microsteps)",
             cal_backoff_fullsteps, cal_backoff_fullsteps * motor_microsteps);
+    if (client.connected()) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", cal_backoff_fullsteps);
+      client.publish(mqtt_backoff_state_topic.c_str(), buf, true);
+    }
   } else {
     log_msg(LOG_ERROR, "CMD", "backoff: must be 1-500 full steps (got %d)", value);
   }
