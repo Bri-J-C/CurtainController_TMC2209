@@ -1,12 +1,12 @@
 // ============================================================================
-// CURTAIN CONTROLLER v5.4 - TMC2209 Edition
+// CURTAIN CONTROLLER v5.5 - TMC2209 Edition
 // Based on original v4.3 with TMC2209 UART control added
 // ============================================================================
 // Target: ESP32-C3 Super Mini
 // Driver: TMC2209 with UART control and StallGuard4
 // ============================================================================
 
-#define FW_VERSION "5.4"
+#define FW_VERSION "5.5"
 
 #include <esp_netif.h>
 #include <WiFi.h>
@@ -19,7 +19,6 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
-#include <MycilaWebSerial.h>
 #include <TMCStepper.h>
 #include <stdarg.h>
 
@@ -28,7 +27,7 @@
 // ============================================================================
 
 // Motor Configuration
-int steps_per_revolution = 2000;
+int travel_steps = 2000;  // total calibrated travel, in microsteps
 
 // Watchdog timeout (increased to handle slow movements)
 const int WDT_TIMEOUT = 180;  // 3 minutes
@@ -36,12 +35,12 @@ const int WDT_TIMEOUT = 180;  // 3 minutes
 // Pin definitions for TMC2209 - ESP32-C3 SUPER MINI
 // Safe pins: GPIO 0,1,3,4,5,6,7,10,20,21
 // Avoid at boot: GPIO 2,8,9 (strapping pins)
-const int STEP_PIN = 10;
-const int DIR_PIN = 6;
-const int ENABLE_PIN = 0;
-const int DIAG_PIN = 7;
-const int TMC_TX_PIN = 21;
-const int TMC_RX_PIN = 20;
+const int STEP_PIN = 6;
+const int DIR_PIN = 5;
+const int ENABLE_PIN = 20;
+const int DIAG_PIN = 21;
+const int TMC_TX_PIN = 7;
+const int TMC_RX_PIN = 10;
 const int STATUS_LED = 8;
 const int RESET_BUTTON_PIN = 9;
 
@@ -71,10 +70,15 @@ unsigned long last_position_report = 0;
 const unsigned long POSITION_REPORT_INTERVAL = 500;
 
 // Motor state
-int step_delay_us = 2000;
+int motor_rpm = 75;                          // shaft speed setting
+int step_delay_us = 2000;                    // derived from motor_rpm and microsteps
+const int MOTOR_FULL_STEPS_PER_REV = 200;    // 1.8 degree motor
+const int MIN_STEP_PERIOD_US = 50;           // step ISR floor
 bool motor_enabled = false;
 unsigned long motor_sleep_timeout = 30000;
 unsigned long last_motor_activity = 0;
+
+bool motor_test_active = false;  // motortest drives the stepper directly
 
 // Calibration state
 enum CalibrationState { CAL_IDLE, CAL_FIND_MIN, CAL_BACKOFF_MIN, CAL_FIND_MAX, CAL_BACKOFF_MAX };
@@ -111,6 +115,7 @@ unsigned long wifi_reconnect_start = 0;
 const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;
 
 volatile bool ws_command_pending = false;
+char ws_pending_command[80];
 const char* last_reset_reason = "Unknown";
 
 // Network
@@ -118,7 +123,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences preferences;
 AsyncWebServer server(80);
-WebSerial WebSerial;
+AsyncWebSocket console_ws("/webserialws");
 String device_hostname;
 String mqtt_server;
 int mqtt_port;
@@ -139,7 +144,6 @@ String mqtt_microsteps_set_topic;
 String mqtt_microsteps_state_topic;
 String mqtt_invert_set_topic;
 String mqtt_invert_state_topic;
-String ws_pending_command;
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -191,6 +195,87 @@ static const char* log_level_name(LogLevel level) {
   }
 }
 
+static const char CONSOLE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Curtain Console</title><style>
+:root{--bg:#0a0a1a;--panel:#12122a;--line:#23234a;--txt:#d8d8ea;--dim:#7d7d9c;--accent:#00D4FF;--err:#ff6b6b;--warn:#ffc46b}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--txt);
+font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{margin:0;font:600 14px system-ui,sans-serif;background:linear-gradient(135deg,#00D4FF,#6366F1);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+#dot{width:9px;height:9px;border-radius:50%;background:var(--err);flex:none}
+#dot.on{background:#3ddc84}
+#state{color:var(--dim);font-size:11px;margin-right:auto}
+button,a.btn{background:#1c1c38;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:.3rem .6rem;
+font:inherit;font-size:11px;cursor:pointer;text-decoration:none;display:inline-block}
+button:hover,a.btn:hover{border-color:var(--accent)}
+#log{flex:1;overflow:auto;padding:.7rem .9rem;white-space:pre-wrap;word-break:break-word}
+#log .e{color:var(--err)}#log .w{color:var(--warn)}#log .d{color:var(--dim)}#log .cmd{color:var(--accent)}
+form{display:flex;gap:.5rem;padding:.6rem .9rem;border-top:1px solid var(--line);background:var(--panel)}
+input{flex:1;background:#0d0d20;border:1px solid var(--line);border-radius:6px;color:var(--txt);
+padding:.5rem .6rem;font:inherit}input:focus{outline:none;border-color:var(--accent)}
+</style></head><body>
+<header><span id="dot"></span><h1>Curtain Console</h1><span id="state">connecting</span>
+<a class="btn" href="/setup">setup</a><button id="clear">clear</button></header>
+<div id="log"></div>
+<form id="f"><input id="c" placeholder="type a command, or help" autocomplete="off" autofocus></form>
+<script>
+var log=document.getElementById('log'),dot=document.getElementById('dot'),state=document.getElementById('state');
+var hist=[],hpos=0,ws;
+function add(t){
+  var atEnd=log.scrollHeight-log.scrollTop-log.clientHeight<40;
+  t.split('\n').forEach(function(line){
+    if(!line&&!t.trim())return;
+    var d=document.createElement('div');
+    if(/^\[ERROR\]/.test(line))d.className='e';
+    else if(/^\[WARN/.test(line))d.className='w';
+    else if(/^\[DEBUG\]/.test(line))d.className='d';
+    else if(/^>/.test(line))d.className='cmd';
+    d.textContent=line;log.appendChild(d);
+  });
+  while(log.childElementCount>800)log.removeChild(log.firstChild);
+  if(atEnd)log.scrollTop=log.scrollHeight;
+}
+function connect(){
+  ws=new WebSocket('ws://'+location.host+'/webserialws');
+  ws.onopen=function(){dot.className='on';state.textContent='connected'};
+  ws.onclose=function(){dot.className='';state.textContent='reconnecting';setTimeout(connect,2000)};
+  ws.onerror=function(){ws.close()};
+  ws.onmessage=function(e){if(e.data)add(e.data)};
+}
+connect();
+document.getElementById('f').onsubmit=function(e){
+  e.preventDefault();var i=document.getElementById('c'),v=i.value.trim();
+  if(!v||!ws||ws.readyState!=1)return;
+  ws.send(v);hist.push(v);hpos=hist.length;i.value='';
+};
+document.getElementById('c').onkeydown=function(e){
+  if(e.key=='ArrowUp'&&hpos>0){hpos--;this.value=hist[hpos];e.preventDefault()}
+  else if(e.key=='ArrowDown'){hpos=Math.min(hpos+1,hist.length);this.value=hist[hpos]||'';e.preventDefault()}
+};
+document.getElementById('clear').onclick=function(){log.innerHTML=''};
+</script></body></html>)HTML";
+
+// Browser console transport. Line buffering keeps partial output() calls together
+// until a newline, so the page receives whole lines.
+String console_buf;
+
+void console_send(const char* text, bool add_newline) {
+  if (console_ws.count() == 0) {
+    console_buf = "";
+    return;
+  }
+  console_buf += text;
+  if (add_newline) console_buf += "\n";
+  int cut = console_buf.lastIndexOf('\n');
+  if (cut < 0) return;
+  String chunk = console_buf.substring(0, cut);
+  console_buf.remove(0, cut + 1);
+  console_ws.textAll(chunk);
+}
+
 void log_msg(LogLevel level, const char* subsystem, const char* fmt, ...) {
   if (level > current_log_level) return;
 
@@ -204,8 +289,7 @@ void log_msg(LogLevel level, const char* subsystem, const char* fmt, ...) {
   snprintf(line, sizeof(line), "[%s] [%s] %s", log_level_name(level), subsystem, msg);
 
   Serial.println(line);
-  if (WebSerial.getConnectionCount() > 0)
-    WebSerial.println(line);
+  console_send(line, true);
 }
 
 // For structured command output (status, config, help, etc.) — no prefix
@@ -216,20 +300,13 @@ void output(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
-  if (WebSerial.getConnectionCount() > 0)
-    WebSerial.print(buf);
+  console_send(buf, false);
 }
 
 // Send a complete String as one WebSocket message (instant display, no line-by-line)
 void ws_send_bulk(const String& text) {
   Serial.print(text);
-  if (WebSerial.getConnectionCount() > 0) {
-    auto* buf = WebSerial.makeBuffer(text.length());
-    if (buf) {
-      memcpy(buf->get(), text.c_str(), text.length());
-      WebSerial.send(buf);
-    }
-  }
+  console_send(text.c_str(), false);
 }
 
 // Append formatted text to a String buffer (for building bulk output)
@@ -253,8 +330,9 @@ void buf_printf(String& out, const char* fmt, ...) {
 const uint32_t STEPS_UNLIMITED = 0xFFFFFFFF;
 const uint32_t RAMP_TIME_US = 300000;    // accel/decel ramp duration
 const uint32_t STALL_BLANK_US = 200000;  // StallGuard ignored this long after the ramp completes
-const uint8_t STALL_CONFIRM = 4;         // score confirming a stall (~consecutive stalled full steps)
-const int CAL_BACKOFF_FULLSTEPS = 15;    // back-off from each wall during calibration
+const uint8_t STALL_CONFIRM = 6;         // score confirming a stall
+const uint8_t STALL_HIT_WEIGHT = 2;      // score added per stalled full step, 1 subtracted per clean one
+int cal_backoff_fullsteps = 15;          // margin kept clear of each mechanical end
 
 hw_timer_t* step_timer = nullptr;
 bool step_timer_on = false;
@@ -263,8 +341,8 @@ volatile int8_t step_dir = 1;
 volatile uint32_t steps_left = 0;
 volatile uint32_t steps_done = 0;
 uint32_t step_period_us = 0;
-uint32_t step_cruise_us = 2000;
-uint32_t step_ramp_steps = 1;
+volatile uint32_t step_cruise_us = 2000;
+volatile uint32_t step_ramp_steps = 1;
 
 // Stall detection state, evaluated once per full step in the step ISR
 volatile uint32_t diag_edges = 0;
@@ -288,15 +366,16 @@ void IRAM_ATTR step_isr() {
   if (steps_left != STEPS_UNLIMITED) steps_left = steps_left - 1;
 
   // StallGuard updates once per full step. A full step counts as stalled if
-  // DIAG pulsed since the last sample or is still high. The score decays on
-  // clean steps, so only sustained stalls reach STALL_CONFIRM.
+  // DIAG pulsed since the last sample or is still high. Stalled steps add more
+  // than clean steps subtract, so a slipping motor that alternates between
+  // stalled and clean still accumulates, while isolated spikes decay away.
   if (steps_done >= stall_blank_steps && steps_done % motor_microsteps == 0) {
     uint32_t edges = diag_edges;
     bool hit = (edges != diag_edges_seen) || (REG_READ(GPIO_IN_REG) & (1UL << DIAG_PIN));
     diag_edges_seen = edges;
     if (hit) {
       stall_fullsteps = stall_fullsteps + 1;
-      if (stall_score < 255) stall_score = stall_score + 1;
+      if (stall_score < 255 - STALL_HIT_WEIGHT) stall_score = stall_score + STALL_HIT_WEIGHT;
       if (stall_score > stall_score_max) stall_score_max = stall_score;
     } else if (stall_score > 0) {
       stall_score = stall_score - 1;
@@ -321,6 +400,12 @@ void IRAM_ATTR step_isr() {
   }
 }
 
+// Cruise period and ramp length, applied live so a speed change mid-move takes effect
+void step_set_speed(uint32_t cruise_us) {
+  step_cruise_us = cruise_us;
+  step_ramp_steps = RAMP_TIME_US * 100 / 185 / cruise_us + 1;
+}
+
 void step_stop() {
   step_running = false;
   if (step_timer_on) {
@@ -336,9 +421,7 @@ void step_start(int8_t dir, uint32_t count, bool stop_on_stall) {
   digitalWrite(DIR_PIN, dir > 0 ? HIGH : LOW);
   steps_left = count;
   steps_done = 0;
-  step_cruise_us = step_delay_us;
-  // Ramp duration ~= 1.85 * ramp_steps * cruise period
-  step_ramp_steps = RAMP_TIME_US * 100 / 185 / step_cruise_us + 1;
+  step_set_speed(step_delay_us);  // ramp duration ~= 1.85 * ramp_steps * cruise period
   stall_blank_steps = step_ramp_steps + STALL_BLANK_US / step_cruise_us;
   stall_stop_enabled = stop_on_stall;
   stall_score = 0;
@@ -408,7 +491,11 @@ void setup_tmc2209() {
   driver.toff(4);
   driver.blank_time(24);
   driver.rms_current(motor_current_ma);
-  driver.microsteps(motor_microsteps);
+  tmc_apply_microsteps(motor_microsteps);
+
+  // Current comes from the UART setting alone; the module's VREF trimpot
+  // otherwise scales it and makes rms_current() advisory
+  driver.I_scale_analog(false);
 
   // StealthChop for quiet operation
   driver.en_spreadCycle(false);
@@ -421,9 +508,6 @@ void setup_tmc2209() {
   driver.semax(0);
   driver.SGTHRS(stall_threshold);
 
-  // Configure DIAG pin for stall output
-  driver.GCONF(driver.GCONF() | (1 << 5));
-
   // Apply direction inversion (after GCONF setup so it doesn't get overwritten)
   driver.shaft(invert_direction);
 
@@ -431,6 +515,31 @@ void setup_tmc2209() {
   attachInterrupt(digitalPinToInterrupt(DIAG_PIN), diag_isr, RISING);
 
   log_msg(LOG_INFO, "TMC", "TMC2209 initialized successfully");
+}
+
+// TMCStepper's microsteps() takes 0 for full step; 1 is not a case in its switch
+// and would be silently ignored, leaving the driver at its 256 power-on default.
+static void tmc_apply_microsteps(uint16_t ms) {
+  driver.microsteps(ms == 1 ? 0 : ms);
+  uint16_t reported = driver.microsteps();
+  uint16_t actual = reported == 0 ? 1 : reported;
+  if (actual != ms) {
+    log_msg(LOG_ERROR, "TMC", "Microsteps not applied: asked %d, driver reports %d", ms, actual);
+  }
+}
+
+// Step interval for the requested shaft speed at the current resolution, so
+// changing microsteps alters smoothness only, not how fast the curtain moves
+void apply_motor_rpm() {
+  uint32_t period = 60000000UL /
+                    ((uint32_t)motor_rpm * MOTOR_FULL_STEPS_PER_REV * motor_microsteps);
+  if (period < MIN_STEP_PERIOD_US) {
+    log_msg(LOG_WARN, "TMC", "%d RPM at %d microsteps needs %luus/step, floor is %dus",
+            motor_rpm, motor_microsteps, (unsigned long)period, MIN_STEP_PERIOD_US);
+    period = MIN_STEP_PERIOD_US;
+  }
+  step_delay_us = (int)period;
+  if (step_running) step_set_speed(step_delay_us);
 }
 
 void set_motor_current(uint16_t ma) {
@@ -445,9 +554,28 @@ void set_motor_microsteps(uint16_t ms) {
   if (!tmc_available) return;
   // Must be power of 2, 1-256
   if (ms == 0 || (ms & (ms - 1)) != 0 || ms > 256) return;
+  if (step_running) {
+    log_msg(LOG_WARN, "TMC", "Cannot change microsteps while moving");
+    return;
+  }
+
+  // Position, travel range and step delay are all counted in microsteps, so they
+  // have to be rescaled or the curtain's stored geometry and speed change with
+  // the resolution
+  if (ms != motor_microsteps && motor_microsteps > 0) {
+    current_position = (int)((int64_t)current_position * ms / motor_microsteps);
+    travel_steps = (int)((int64_t)travel_steps * ms / motor_microsteps);
+
+    preferences.putInt("position", current_position);
+    preferences.putInt("steps_per_rev", travel_steps);
+    log_msg(LOG_INFO, "TMC", "Rescaled for %d microsteps: position %d, travel %d",
+            ms, current_position, travel_steps);
+  }
+
   motor_microsteps = ms;
-  driver.microsteps(ms);
+  tmc_apply_microsteps(ms);
   preferences.putUShort("microsteps", ms);
+  apply_motor_rpm();
 }
 
 void set_stall_threshold(uint8_t threshold) {
@@ -518,13 +646,13 @@ void save_position() {
 }
 
 void start_movement(int target) {
-  if (is_moving || cal_state != CAL_IDLE) return;
+  if (is_moving || cal_state != CAL_IDLE || motor_test_active) return;
   if (!tmc_available) {
     log_msg(LOG_ERROR, "MOTOR", "TMC2209 not available, cannot move");
     return;
   }
 
-  target_position = constrain(target, 0, steps_per_revolution);
+  target_position = constrain(target, 0, travel_steps);
   if (current_position == target_position) {
     log_msg(LOG_INFO, "MOTOR", "Already at position %d", current_position);
     return;
@@ -537,13 +665,13 @@ void start_movement(int target) {
     dir = 1;
     log_msg(LOG_INFO, "MOTOR", "Opening: %d -> %d (%d%%)",
             current_position, target_position,
-            (target_position * 100) / steps_per_revolution);
+            (target_position * 100) / travel_steps);
     publish_status("opening");
   } else {
     dir = -1;
     log_msg(LOG_INFO, "MOTOR", "Closing: %d -> %d (%d%%)",
             current_position, target_position,
-            (target_position * 100) / steps_per_revolution);
+            (target_position * 100) / travel_steps);
     publish_status("closing");
   }
 
@@ -584,7 +712,7 @@ void handle_movement() {
 
   if (!step_running) {
     log_msg(LOG_INFO, "MOTOR", "Movement complete, position %d (%d%%)",
-            current_position, (current_position * 100) / steps_per_revolution);
+            current_position, (current_position * 100) / travel_steps);
     stop_movement("Complete");
     return;
   }
@@ -622,7 +750,7 @@ void start_calibration() {
     log_msg(LOG_ERROR, "CAL", "Cannot calibrate: TMC2209 not available");
     return;
   }
-  if (is_moving || cal_state != CAL_IDLE) {
+  if (is_moving || cal_state != CAL_IDLE || motor_test_active) {
     log_msg(LOG_WARN, "CAL", "Cannot calibrate: motor busy");
     return;
   }
@@ -655,7 +783,7 @@ void handle_calibration() {
   last_motor_activity = millis();
   if (step_running) return;
 
-  const int backoff = CAL_BACKOFF_FULLSTEPS * motor_microsteps;
+  const int backoff = cal_backoff_fullsteps * motor_microsteps;
 
   switch (cal_state) {
     case CAL_FIND_MIN:
@@ -686,11 +814,11 @@ void handle_calibration() {
 
     case CAL_BACKOFF_MAX:
       // Close back-off is already accounted for in position 0
-      steps_per_revolution = current_position;
-      preferences.putInt("steps_per_rev", steps_per_revolution);
+      travel_steps = current_position;
+      preferences.putInt("steps_per_rev", travel_steps);
       save_position();
-      log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps (margins: %d+%d)",
-              steps_per_revolution, backoff, backoff);
+      log_msg(LOG_INFO, "CAL", "Calibration complete! Usable range: %d steps, %d full steps clear of each end",
+              travel_steps, cal_backoff_fullsteps);
       cal_state = CAL_IDLE;
       is_moving = false;
       publish_position();
@@ -714,7 +842,7 @@ void publish_status(const char* status) {
 
 void publish_position() {
   if (client.connected()) {
-    int percentage = (current_position * 100) / steps_per_revolution;
+    int percentage = (current_position * 100) / travel_steps;
     char pos_str[8];
     snprintf(pos_str, sizeof(pos_str), "%d", percentage);
     client.publish(mqtt_position_topic.c_str(), pos_str, true);
@@ -815,17 +943,17 @@ void publish_ha_discovery(bool force) {
 
   // Speed number entity
   {
-    String topic = "homeassistant/number/" + device_hostname + "_speed/config";
+    String topic = "homeassistant/number/" + device_hostname + "_speed_rpm/config";
     StaticJsonDocument<512> doc;
     doc["name"] = "Speed";
-    doc["unique_id"] = "curtain_" + device_hostname + "_speed";
-    doc["object_id"] = device_hostname + "_speed";
+    doc["unique_id"] = "curtain_" + device_hostname + "_speed_rpm";
+    doc["object_id"] = device_hostname + "_speed_rpm";
     doc["command_topic"] = mqtt_speed_set_topic;
     doc["state_topic"] = mqtt_speed_state_topic;
-    doc["min"] = 100;
-    doc["max"] = 10000;
-    doc["step"] = 100;
-    doc["unit_of_measurement"] = "us";
+    doc["min"] = 10;
+    doc["max"] = 300;
+    doc["step"] = 5;
+    doc["unit_of_measurement"] = "RPM";
     doc["icon"] = "mdi:speedometer";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
@@ -936,8 +1064,10 @@ void publish_ha_discovery(bool force) {
     client.publish(topic.c_str(), json.c_str(), true);
   }
 
-  // Remove old stallthreshold number entity (replaced by sensitivity select)
+  // Remove entities replaced by newer ones
   String old_topic = "homeassistant/number/" + device_hostname + "_stallthreshold/config";
+  client.publish(old_topic.c_str(), "", true);
+  old_topic = "homeassistant/number/" + device_hostname + "_speed/config";
   client.publish(old_topic.c_str(), "", true);
 
   log_msg(LOG_INFO, "MQTT", "HA settings entities published");
@@ -946,7 +1076,7 @@ void publish_ha_discovery(bool force) {
 void publish_settings_state() {
   if (!client.connected()) return;
   char buf[16];
-  snprintf(buf, sizeof(buf), "%d", step_delay_us);
+  snprintf(buf, sizeof(buf), "%d", motor_rpm);
   client.publish(mqtt_speed_state_topic.c_str(), buf, true);
   snprintf(buf, sizeof(buf), "%d", motor_current_ma);
   client.publish(mqtt_current_state_topic.c_str(), buf, true);
@@ -965,12 +1095,13 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   // Settings topics
   if (strcmp(topic, mqtt_speed_set_topic.c_str()) == 0) {
     int value = msg.toInt();
-    if (value >= 100 && value <= 10000) {
-      step_delay_us = value;
-      preferences.putInt("step_delay", step_delay_us);
-      log_msg(LOG_INFO, "MQTT", "Speed set to %d us", step_delay_us);
+    if (value >= 10 && value <= 300) {
+      motor_rpm = value;
+      preferences.putInt("rpm", motor_rpm);
+      apply_motor_rpm();
+      log_msg(LOG_INFO, "MQTT", "Speed set to %d RPM", motor_rpm);
       char buf[16];
-      snprintf(buf, sizeof(buf), "%d", step_delay_us);
+      snprintf(buf, sizeof(buf), "%d", motor_rpm);
       client.publish(mqtt_speed_state_topic.c_str(), buf, true);
     }
     return;
@@ -1092,7 +1223,7 @@ void connect_mqtt() {
     client.subscribe(mqtt_invert_set_topic.c_str());
     client.publish(mqtt_availability_topic.c_str(), "online", true);
     publish_position();
-    publish_status(current_position >= steps_per_revolution ? "open" :
+    publish_status(current_position >= travel_steps ? "open" :
                    current_position <= 0 ? "closed" : "open");
     publish_ha_discovery(true);
     publish_settings_state();
@@ -1115,8 +1246,8 @@ void setup_mqtt() {
   mqtt_position_topic = mqtt_root_topic + "/position";
   mqtt_availability_topic = mqtt_root_topic + "/availability";
   mqtt_calibrate_topic = mqtt_root_topic + "/calibrate";
-  mqtt_speed_set_topic = mqtt_root_topic + "/speed/set";
-  mqtt_speed_state_topic = mqtt_root_topic + "/speed/state";
+  mqtt_speed_set_topic = mqtt_root_topic + "/speed_rpm/set";
+  mqtt_speed_state_topic = mqtt_root_topic + "/speed_rpm/state";
   mqtt_current_set_topic = mqtt_root_topic + "/current/set";
   mqtt_current_state_topic = mqtt_root_topic + "/current/state";
   mqtt_stallthreshold_set_topic = mqtt_root_topic + "/stallthreshold/set";
@@ -1139,7 +1270,7 @@ void setup_mqtt() {
 
 void cmd_open(const String& param) {
   log_msg(LOG_INFO, "CMD", "open");
-  start_movement(steps_per_revolution);
+  start_movement(travel_steps);
 }
 
 void cmd_close(const String& param) {
@@ -1158,17 +1289,19 @@ void cmd_stop(const String& param) {
 
 void cmd_speed(const String& param) {
   int value = param.toInt();
-  if (value >= 100 && value <= 10000) {
-    step_delay_us = value;
-    preferences.putInt("step_delay", step_delay_us);
-    log_msg(LOG_INFO, "NVS", "Speed set to %d us/step", step_delay_us);
+  if (value >= 10 && value <= 300) {
+    motor_rpm = value;
+    preferences.putInt("rpm", motor_rpm);
+    apply_motor_rpm();
+    log_msg(LOG_INFO, "NVS", "Speed set to %d RPM (%dus/step at %d microsteps)",
+            motor_rpm, step_delay_us, motor_microsteps);
     if (client.connected()) {
       char buf[16];
-      snprintf(buf, sizeof(buf), "%d", step_delay_us);
+      snprintf(buf, sizeof(buf), "%d", motor_rpm);
       client.publish(mqtt_speed_state_topic.c_str(), buf, true);
     }
   } else {
-    log_msg(LOG_ERROR, "CMD", "speed: value must be 100-10000 us (got %d)", value);
+    log_msg(LOG_ERROR, "CMD", "speed: value must be 10-300 RPM (got %d)", value);
   }
 }
 
@@ -1224,6 +1357,18 @@ void apply_sensitivity(uint8_t value, const char* label) {
   publish_sensitivity_state();
 }
 
+void cmd_backoff(const String& param) {
+  int value = param.toInt();
+  if (value >= 1 && value <= 500) {
+    cal_backoff_fullsteps = value;
+    preferences.putInt("cal_backoff", cal_backoff_fullsteps);
+    log_msg(LOG_INFO, "NVS", "Calibration back-off set to %d full steps (%d microsteps)",
+            cal_backoff_fullsteps, cal_backoff_fullsteps * motor_microsteps);
+  } else {
+    log_msg(LOG_ERROR, "CMD", "backoff: must be 1-500 full steps (got %d)", value);
+  }
+}
+
 void cmd_sensitivity(const String& param) {
   String p = param;
   p.trim();
@@ -1263,9 +1408,9 @@ void cmd_calibrate(const String& param) {
 void cmd_travelsteps(const String& param) {
   int value = param.toInt();
   if (value > 0 && value <= 500000) {
-    steps_per_revolution = value;
-    preferences.putInt("steps_per_rev", steps_per_revolution);
-    log_msg(LOG_INFO, "NVS", "Total travel steps set to %d", steps_per_revolution);
+    travel_steps = value;
+    preferences.putInt("steps_per_rev", travel_steps);
+    log_msg(LOG_INFO, "NVS", "Total travel steps set to %d", travel_steps);
   } else {
     log_msg(LOG_ERROR, "CMD", "travelsteps: must be 1-500000 (got %d)", value);
   }
@@ -1273,13 +1418,13 @@ void cmd_travelsteps(const String& param) {
 
 void cmd_setposition(const String& param) {
   int value = param.toInt();
-  if (value >= 0 && value <= steps_per_revolution) {
+  if (value >= 0 && value <= travel_steps) {
     current_position = value;
     save_position();
     publish_position();
     log_msg(LOG_INFO, "NVS", "Position reset to %d", current_position);
   } else {
-    log_msg(LOG_ERROR, "CMD", "setposition: must be 0-%d (got %d)", steps_per_revolution, value);
+    log_msg(LOG_ERROR, "CMD", "setposition: must be 0-%d (got %d)", travel_steps, value);
   }
 }
 
@@ -1314,11 +1459,13 @@ void cmd_config(const String& param) {
   buf_printf(out, "MQTT: %s:%d\n", mqtt_server.c_str(), mqtt_port);
   buf_printf(out, "MQTT User: %s\n", mqtt_user.length() > 0 ? mqtt_user.c_str() : "(none)");
   buf_printf(out, "MQTT Topic: %s\n", mqtt_topic.c_str());
-  buf_printf(out, "Speed: %d us/step (lower=faster)\n", step_delay_us);
+  buf_printf(out, "Speed: %d RPM (%dus/step at %d microsteps)\n", motor_rpm, step_delay_us, motor_microsteps);
   buf_printf(out, "Microsteps: %d\n", motor_microsteps);
   buf_printf(out, "Current: %d mA\n", motor_current_ma);
   buf_printf(out, "Sensitivity: %s (threshold=%d)\n", sensitivity_name(stall_threshold), stall_threshold);
-  buf_printf(out, "Travel Steps: %d\n", steps_per_revolution);
+  buf_printf(out, "End back-off: %d full steps (%d microsteps)\n",
+             cal_backoff_fullsteps, cal_backoff_fullsteps * motor_microsteps);
+  buf_printf(out, "Travel Steps: %d\n", travel_steps);
   buf_printf(out, "Invert Direction: %s\n", invert_direction ? "YES" : "NO");
   buf_printf(out, "Sleep Timeout: %lu ms\n", motor_sleep_timeout);
   buf_printf(out, "TMC2209: %s\n", tmc_available ? "OK" : "NOT CONNECTED");
@@ -1351,10 +1498,11 @@ void cmd_help(const String& param) {
     "stop              Stop movement / cancel calibrate\n"
     "<0-100>           Move to percentage\n"
     "\n=== Settings ===\n"
-    "speed <us>        Step delay (100-10000, lower=faster)\n"
+    "speed <rpm>       Shaft speed (10-300 RPM)\n"
     "current <mA>      Motor current (100-2000)\n"
     "microsteps <n>    Microsteps (1,2,4,8,16,32,64,128,256)\n"
     "sensitivity <lvl> Stall sensitivity (extra_low|low|medium|high|max|custom N)\n"
+    "backoff <n>       Full steps kept clear of each end after calibration\n"
     "invert            Toggle open/close direction\n"
     "sleep <ms>        Motor sleep timeout (0=never)\n"
     "travelsteps <n>   Total travel range in steps\n"
@@ -1365,6 +1513,7 @@ void cmd_help(const String& param) {
     "status            Position, motor, MQTT, TMC status\n"
     "config            Full configuration dump\n"
     "verbose           Toggle SG debug during movement\n"
+    "tmcdiag           Probe the TMC2209 UART link and report what came back\n"
     "loglevel <level>  Set log level (error|warn|info|debug)\n"
     "ledon / ledoff    Manual LED control\n"
     "\n=== System ===\n"
@@ -1380,7 +1529,7 @@ void cmd_status(const String& param) {
 
   buf_printf(out, "\n=== Status ===\n");
   buf_printf(out, "Position: %d (%d%%)\n", current_position,
-         (current_position * 100) / steps_per_revolution);
+         (current_position * 100) / travel_steps);
   buf_printf(out, "Moving: %s\n", is_moving ? "Yes" : "No");
   if (is_moving) {
     buf_printf(out, "Target: %d\n", target_position);
@@ -1440,16 +1589,25 @@ void cmd_motortest(const String& param) {
   output("Uses the same detector as calibration. Apply resistance to the shaft to test.\n\n");
 
   wake_motor();
+  motor_test_active = true;
   step_start(1, STEPS_UNLIMITED, false);  // count stalls without stopping
 
   unsigned long test_start = millis();
   unsigned long last_sample = 0, last_report = 0;
-  uint16_t min_sg = 1023, max_sg = 0, latest = 0;
-  uint32_t sg_sum = 0, sg_count = 0, read_errors = 0;
+  uint16_t free_min = 1023, free_max = 0, latest = 0;
+  uint32_t free_sum = 0, free_count = 0, read_errors = 0;
+  uint8_t peak_score = 0, interval_peak = 0;
+  uint32_t interval_mark = 0;
+  int stall_events = 0;
 
   while (millis() - test_start < (unsigned long)duration * 1000) {
     unsigned long now = millis();
     bool settled = steps_done >= stall_blank_steps;
+
+    // Sampled every pass: a short stall can start and end between report lines
+    uint8_t score_now = stall_score;
+    if (score_now > interval_peak) interval_peak = score_now;
+    if (score_now > peak_score) peak_score = score_now;
 
     if (settled && now - last_sample >= 50) {
       last_sample = now;
@@ -1459,10 +1617,13 @@ void cmd_motortest(const String& param) {
         continue;
       }
       latest = sg;
-      if (latest < min_sg) min_sg = latest;
-      if (latest > max_sg) max_sg = latest;
-      sg_sum += latest;
-      sg_count++;
+      // Free-running baseline: samples taken while nothing is flagged as stalled
+      if (score_now == 0) {
+        if (sg < free_min) free_min = sg;
+        if (sg > free_max) free_max = sg;
+        free_sum += sg;
+        free_count++;
+      }
     }
 
     if (now - last_report >= 500) {
@@ -1470,54 +1631,262 @@ void cmd_motortest(const String& param) {
       if (!settled) {
         output("  Ramping up...\n");
       } else {
+        uint32_t interval_steps = stall_fullsteps - interval_mark;
+        interval_mark = stall_fullsteps;
+        bool tripped = interval_peak >= STALL_CONFIRM;
+        if (tripped) stall_events++;
+
         // Visual load bar: higher SG = more blocks = lighter load
         int blocks = constrain(latest / 40, 0, 16);
         char bar[17];
         for (int i = 0; i < 16; i++) bar[i] = (i < blocks) ? '#' : '.';
         bar[16] = 0;
-        output("  SG:%4d [%s] stalled full steps:%lu score:%d/%d%s\n",
-               latest, bar, stall_fullsteps, stall_score, STALL_CONFIRM,
-               stall_score >= STALL_CONFIRM ? "  STALL!" : "");
+
+        output("  SG:%4d [%s] stalled:%lu peak:%d/%d%s\n", latest, bar,
+               (unsigned long)interval_steps, interval_peak, STALL_CONFIRM,
+               tripped ? "  STALL!" : "");
+        interval_peak = 0;
       }
       esp_task_wdt_reset();
+    }
+
+    // Keep the network alive: this loop blocks the main loop for the whole test,
+    // and PubSubClient's keepalive is 15s
+    client.loop();
+    ArduinoOTA.handle();
+
+    if (ws_command_pending) {
+      bool abort = strcmp(ws_pending_command, "stop") == 0;
+      ws_command_pending = false;  // consume it either way, or the console latches
+      if (abort) {
+        output("  Aborted\n");
+        break;
+      }
+      output("  Ignored during test: %s\n", ws_pending_command);
     }
     delay(1);
   }
 
   stop_motor();
+  motor_test_active = false;
 
   output("\n=== Results ===\n");
-  if (sg_count == 0) {
-    output("No samples (test too short for this speed)\n");
-    return;
-  }
-  uint16_t avg_sg = sg_sum / sg_count;
-  output("SG_RESULT: avg %d, min %d, max %d (stall line: %d)\n", avg_sg, min_sg, max_sg, stall_line);
-  output("Stalled full steps: %lu, peak score: %d (calibration stops at %d)\n",
-         stall_fullsteps, stall_score_max, STALL_CONFIRM);
-  if (read_errors > 0) {
-    output("UART read errors: %lu (skipped; check PDN_UART wiring if frequent)\n", read_errors);
-  }
-
-  if (stall_score_max >= STALL_CONFIRM) {
-    output("\nWould trigger a FALSE stall during calibration. Lower sensitivity.\n");
-  } else if (stall_fullsteps > 0) {
-    output("\nOccasional stall pulses, filtered out by the confirm logic.\n");
+  if (free_count == 0) {
+    output("No free-running samples: the motor was loaded the whole time.\n");
   } else {
-    output("\nNo stall pulses while running free.\n");
+    output("Free-running SG: avg %lu, min %d, max %d (stall line: %d)\n",
+           (unsigned long)(free_sum / free_count), free_min, free_max, stall_line);
+  }
+  output("Stall events: %d (peak score %d, confirm at %d)\n", stall_events, peak_score, STALL_CONFIRM);
+  output("Stalled full steps total: %lu\n", (unsigned long)stall_fullsteps);
+  if (read_errors > 0) {
+    output("UART read errors: %lu (skipped; check wiring if frequent)\n", (unsigned long)read_errors);
   }
 
-  // Stall line at ~60% of the lowest free-running SG leaves margin both ways
-  int suggested = constrain(min_sg * 3 / 10, 1, 255);
-  output("Suggested (if the curtain ran freely): sensitivity custom %d\n", suggested);
+  if (stall_events > 0) {
+    output("\nStalls were detected. If you applied resistance, the detector is working.\n");
+    output("If the shaft was free the whole run, lower the sensitivity.\n");
+  } else if (stall_fullsteps > 0) {
+    output("\nSome stalled full steps, none sustained enough to confirm.\n");
+  } else {
+    output("\nNo stall pulses at all this run.\n");
+  }
 
-  if (avg_sg < 50) {
-    output("\nWarning: Motor is under heavy load even when free.\n");
-    output("Check: Is something blocking the curtain?\n");
-    output("Try:   current %d   (increase motor power)\n", constrain(motor_current_ma + 200, 100, 2000));
+  if (free_count > 0) {
+    // Stall line at ~60% of the lowest free-running load leaves margin both ways
+    int suggested = constrain(free_min * 3 / 10, 1, 255);
+    output("Suggested sensitivity for this speed and current: custom %d\n", suggested);
+    if (free_min < stall_line) {
+      output("Warning: free-running load already dips below the stall line.\n");
+    }
+  }
+
+  uint32_t avg = free_count ? free_sum / free_count : 0;
+  if (free_count > 0 && avg < 50) {
+    output("\nWarning: heavy load even when free. Check for binding.\n");
+    output("Try:   current %d\n", constrain(motor_current_ma + 200, 100, 2000));
   }
 
   output("===============\n");
+}
+
+// TMC2209 UART datagram CRC (datasheet section 5.2)
+static uint8_t tmc_crc(const uint8_t* data, uint8_t len) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t byte = data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      if ((crc >> 7) ^ (byte & 0x01)) crc = (crc << 1) ^ 0x07;
+      else crc <<= 1;
+      byte >>= 1;
+    }
+  }
+  return crc;
+}
+
+// Send a read request and capture everything that lands on RX: on a single-wire
+// bus that is the 4-byte echo of our own request, then the driver's 8-byte reply.
+static int tmc_probe(uint8_t address, uint8_t reg, uint8_t* buf, int max_len) {
+  while (TMCSerial.available()) TMCSerial.read();
+
+  uint8_t req[4] = { 0x05, address, reg, 0 };
+  req[3] = tmc_crc(req, 3);
+  TMCSerial.write(req, 4);
+  TMCSerial.flush();
+
+  int len = 0;
+  unsigned long deadline = millis() + 100;
+  while (len < max_len && millis() < deadline) {
+    if (TMCSerial.available()) buf[len++] = TMCSerial.read();
+  }
+  return len;
+}
+
+// A valid capture is echo + reply with a good CRC; returns the register value
+static bool tmc_parse(const uint8_t* buf, int len, uint32_t* value) {
+  if (len < 12) return false;
+  const uint8_t* reply = buf + 4;
+  if (reply[0] != 0x05 || reply[1] != 0xFF) return false;
+  if (tmc_crc(reply, 7) != reply[7]) return false;
+  *value = ((uint32_t)reply[3] << 24) | ((uint32_t)reply[4] << 16) |
+           ((uint32_t)reply[5] << 8) | reply[6];
+  return true;
+}
+
+static bool tmc_read_reg(uint8_t address, uint8_t reg, uint32_t* value) {
+  uint8_t buf[16];
+  int len = tmc_probe(address, reg, buf, sizeof(buf));
+  return tmc_parse(buf, len, value);
+}
+
+void cmd_tmcdiag(const String& param) {
+  String out;
+  out.reserve(1500);
+
+  buf_printf(out, "\n=== TMC2209 Diagnostics ===\n");
+  buf_printf(out, "Firmware pins: STEP:%d DIR:%d EN:%d DIAG:%d TX:%d RX:%d\n",
+             STEP_PIN, DIR_PIN, ENABLE_PIN, DIAG_PIN, TMC_TX_PIN, TMC_RX_PIN);
+  buf_printf(out, "Detected at boot: %s\n", tmc_available ? "yes" : "no");
+  buf_printf(out, "DIAG pin now: %s\n", digitalRead(DIAG_PIN) ? "HIGH" : "LOW");
+
+  uint8_t buf[16];
+  int found_addr = -1;
+  bool any_echo = false, any_bytes = false;
+
+  for (uint8_t addr = 0; addr < 4; addr++) {
+    int len = tmc_probe(addr, 0x06, buf, sizeof(buf));  // IOIN
+    if (len > 0) any_bytes = true;
+
+    bool echo = (len >= 4 && buf[0] == 0x05 && buf[1] == addr && buf[2] == 0x06);
+    if (echo) any_echo = true;
+
+    uint32_t ioin = 0;
+    bool reply = tmc_parse(buf, len, &ioin);
+
+    buf_printf(out, "addr %d: %d bytes", addr, len);
+    if (len > 0) {
+      buf_printf(out, " [");
+      for (int i = 0; i < len && i < 12; i++) buf_printf(out, "%02X ", buf[i]);
+      buf_printf(out, "]");
+    }
+    buf_printf(out, " echo:%s reply:%s", echo ? "yes" : "no", reply ? "yes" : "no");
+    if (reply) {
+      buf_printf(out, " IOIN:0x%08X version:0x%02X", ioin, (uint8_t)(ioin >> 24));
+      if (found_addr < 0) found_addr = addr;
+    }
+    buf_printf(out, "\n");
+    yield();
+  }
+
+  if (found_addr >= 0) {
+    uint32_t before = 0, after = 0;
+    int len = tmc_probe(found_addr, 0x02, buf, sizeof(buf));  // IFCNT
+    bool got_before = tmc_parse(buf, len, &before);
+    driver.SGTHRS(stall_threshold);  // a write the driver should count
+    len = tmc_probe(found_addr, 0x02, buf, sizeof(buf));
+    bool got_after = tmc_parse(buf, len, &after);
+    if (got_before && got_after) {
+      buf_printf(out, "IFCNT: %u -> %u (writes %s)\n", before, after,
+                 after != before ? "accepted" : "NOT accepted");
+    }
+  }
+
+  if (found_addr >= 0) {
+    uint32_t gconf = 0, chop = 0, drv = 0, tstep = 0, sg = 0, pwm = 0, sgthrs = 0, ihold = 0;
+    bool has_gconf = tmc_read_reg(found_addr, 0x00, &gconf);
+    bool has_chop = tmc_read_reg(found_addr, 0x6C, &chop);
+    bool has_drv = tmc_read_reg(found_addr, 0x6F, &drv);
+    tmc_read_reg(found_addr, 0x12, &tstep);
+    tmc_read_reg(found_addr, 0x41, &sg);
+    tmc_read_reg(found_addr, 0x71, &pwm);
+    bool has_sgthrs = tmc_read_reg(found_addr, 0x40, &sgthrs);
+    bool has_ihold = tmc_read_reg(found_addr, 0x10, &ihold);
+
+    buf_printf(out, "-- Live registers --\n");
+
+    if (has_gconf) {
+      buf_printf(out, "GCONF     0x%08X  %s inv:%s uart:%s analog_iref:%s index_step:%s\n", gconf,
+                 (gconf & (1 << 2)) ? "SpreadCycle" : "StealthChop",
+                 (gconf & (1 << 3)) ? "yes" : "no",
+                 (gconf & (1 << 6)) ? "on" : "off",
+                 (gconf & (1 << 0)) ? "yes" : "no",
+                 (gconf & (1 << 5)) ? "yes" : "no");
+    }
+
+    if (has_chop) {
+      uint8_t mres = (chop >> 24) & 0x0F;
+      uint8_t toff = chop & 0x0F;
+      bool vsense = chop & (1UL << 17);
+      buf_printf(out, "CHOPCONF  0x%08X  microsteps:%d interpolate:%s toff:%d vsense:%s\n", chop,
+                 256 >> mres, (chop & (1UL << 28)) ? "yes" : "no", toff, vsense ? "high" : "low");
+      if (toff == 0) buf_printf(out, "          toff=0: driver output is off\n");
+    }
+
+    if (has_drv) {
+      uint8_t cs = (drv >> 16) & 0x1F;
+      float vfs = (has_chop && (chop & (1UL << 17))) ? 0.180f : 0.325f;
+      int ma = (int)(((cs + 1) / 32.0f) * (vfs / (R_SENSE + 0.02f)) / 1.41421f * 1000.0f);
+      bool standstill = drv & (1UL << 31);
+      buf_printf(out, "DRV_STATUS 0x%08X CS:%d/31 (~%dmA rms %s) %s %s\n", drv, cs, ma,
+                 standstill ? "hold" : "run",
+                 (drv & (1UL << 30)) ? "stealth" : "spread",
+                 standstill ? "standstill" : "running");
+      if (standstill) {
+        buf_printf(out, "          hold current is a fraction of run current, so this reads below the setting\n");
+      }
+      if (drv & 0x3F) {
+        buf_printf(out, "          flags: otpw:%d ot:%d s2g:%d%d s2vs:%d%d\n", (int)(drv & 1),
+                   (int)((drv >> 1) & 1), (int)((drv >> 2) & 1), (int)((drv >> 3) & 1),
+                   (int)((drv >> 4) & 1), (int)((drv >> 5) & 1));
+      }
+    }
+
+    buf_printf(out, "TSTEP:%u SG_RESULT:%u PWM_SCALE:0x%04X\n", tstep & 0xFFFFF, sg & 0x3FF,
+               (unsigned)(pwm & 0xFFFF));
+
+    // These are write-only on the TMC2209; a successful read of 0 means no readback
+    buf_printf(out, "SGTHRS read:%s firmware:%d | IHOLD_IRUN read:%s firmware:%dmA\n",
+               has_sgthrs ? String(sgthrs).c_str() : "no reply", stall_threshold,
+               has_ihold ? String(ihold).c_str() : "no reply", motor_current_ma);
+  }
+
+  buf_printf(out, "--\n");
+  if (found_addr >= 0) {
+    buf_printf(out, "Link OK at address %d.\n", found_addr);
+    if (found_addr != DRIVER_ADDRESS) {
+      buf_printf(out, "Firmware expects address %d — check MS1/MS2.\n", DRIVER_ADDRESS);
+    }
+  } else if (any_echo) {
+    buf_printf(out, "Echo but no reply: wiring to the ESP32 is fine, the driver is not answering.\n");
+    buf_printf(out, "Check VM (motor supply) and VDD, and that MS1/MS2 set the expected address.\n");
+  } else if (any_bytes) {
+    buf_printf(out, "Garbled bytes: baud mismatch or bus contention.\n");
+  } else {
+    buf_printf(out, "Nothing on RX, not even our own echo.\n");
+    buf_printf(out, "TX is not reaching RX — check both go to the driver's UART pad, and the pins above.\n");
+  }
+  buf_printf(out, "===========================\n");
+  ws_send_bulk(out);
 }
 
 void cmd_loglevel(const String& param) {
@@ -1565,6 +1934,7 @@ const Command commands[] = {
   {"speed ", cmd_speed},
   {"microsteps ", cmd_microsteps},
   {"current ", cmd_current},
+  {"backoff ", cmd_backoff},
   {"sensitivity ", cmd_sensitivity},
   {"sensitivity", cmd_sensitivity},
   {"calibrate", cmd_calibrate},
@@ -1578,6 +1948,7 @@ const Command commands[] = {
   {"verbose", cmd_verbose},
   {"motortest ", cmd_motortest},
   {"motortest", cmd_motortest},
+  {"tmcdiag", cmd_tmcdiag},
   {"loglevel ", cmd_loglevel},
   {"restart", cmd_restart},
   {"help", cmd_help},
@@ -1625,7 +1996,7 @@ void process_command(const String& cmd) {
   if (is_numeric && command.length() > 0) {
     int percentage = command.toInt();
     if (percentage >= 0 && percentage <= 100) {
-      int target_steps = (percentage * steps_per_revolution) / 100;
+      int target_steps = (percentage * travel_steps) / 100;
       log_msg(LOG_INFO, "CMD", "HA position: %d%% -> step %d", percentage, target_steps);
       start_movement(target_steps);
       return;
@@ -1771,7 +2142,7 @@ void setup_webserial() {
     html.replace("%CURRENT%", String(preferences.getUShort("current_ma", 800)));
 
     // Microsteps dropdown selected state
-    uint16_t ms = preferences.getUShort("microsteps", 2);
+    uint16_t ms = motor_microsteps;
     html.replace("%MS1%", ms == 1 ? "selected" : "");
     html.replace("%MS2%", ms == 2 ? "selected" : "");
     html.replace("%MS4%", ms == 4 ? "selected" : "");
@@ -1812,6 +2183,21 @@ void setup_webserial() {
     if (request->hasParam("mqtt_topic", true)) {
       preferences.putString("mqtt_root_topic", request->getParam("mqtt_topic", true)->value());
     }
+    // Microsteps first: position and travel are counted in microsteps, so they
+    // are rescaled here, and an explicit travel value below still wins. Only NVS
+    // is touched — the driver is configured from these on the reboot that follows.
+    if (request->hasParam("microsteps", true)) {
+      int val = request->getParam("microsteps", true)->value().toInt();
+      uint16_t previous = preferences.getUShort("microsteps", motor_microsteps);
+      bool valid = val > 0 && val <= 256 && (val & (val - 1)) == 0;
+      if (valid && (uint16_t)val != previous) {
+        int pos = preferences.getInt("position", 0);
+        int travel = preferences.getInt("steps_per_rev", 2000);
+        preferences.putInt("position", (int)((int64_t)pos * val / previous));
+        preferences.putInt("steps_per_rev", (int)((int64_t)travel * val / previous));
+        preferences.putUShort("microsteps", val);
+      }
+    }
     if (request->hasParam("steps", true)) {
       int steps = request->getParam("steps", true)->value().toInt();
       if (steps > 0) preferences.putInt("steps_per_rev", steps);
@@ -1819,10 +2205,6 @@ void setup_webserial() {
     if (request->hasParam("current", true)) {
       int val = request->getParam("current", true)->value().toInt();
       if (val >= 100 && val <= 2000) preferences.putUShort("current_ma", val);
-    }
-    if (request->hasParam("microsteps", true)) {
-      int val = request->getParam("microsteps", true)->value().toInt();
-      preferences.putUShort("microsteps", val);
     }
     if (request->hasParam("stallthreshold", true)) {
       int val = request->getParam("stallthreshold", true)->value().toInt();
@@ -1839,26 +2221,32 @@ void setup_webserial() {
     ESP.restart();
   });
 
-  WebSerial.onMessage([](uint8_t *data, size_t len) {
-    String command;
-    command.reserve(len + 1);
+  console_ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type,
+                        void* arg, uint8_t* data, size_t len) {
+    if (type != WS_EVT_DATA) return;
 
-    for (size_t i = 0; i < len; i++) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (!info->final || info->index != 0 || info->len != len || info->opcode != WS_TEXT) return;
+
+    // Runs on the AsyncTCP task: fill the buffer, then raise the flag. Echoing
+    // and processing happen in the main loop, which owns the console buffer.
+    if (ws_command_pending) return;
+
+    size_t out = 0;
+    for (size_t i = 0; i < len && out < sizeof(ws_pending_command) - 1; i++) {
       char c = (char)data[i];
-      if (c >= 32 && c <= 126) command += c;
+      if (c >= 32 && c <= 126) ws_pending_command[out++] = c;
     }
-
-    command.trim();
-    if (command.length() == 0) return;
-
-    output("> %s\n", command.c_str());
-
-    ws_pending_command = command;
+    while (out > 0 && ws_pending_command[out - 1] == ' ') out--;
+    ws_pending_command[out] = 0;
+    if (out == 0) return;
     ws_command_pending = true;
   });
+  server.addHandler(&console_ws);
 
-  WebSerial.begin(&server);
-  WebSerial.setBuffer(256);
+  server.on("/webserial", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html", CONSOLE_HTML);
+  });
   server.begin();
 }
 
@@ -1901,7 +2289,7 @@ void start_config_portal() {
   WiFiManagerParameter p_pass("password", "MQTT Password", mqtt_password.c_str(), 40);
   WiFiManagerParameter p_topic("mqtt_root_topic", "MQTT Root Topic", mqtt_topic.c_str(), 80);
   WiFiManagerParameter p_ota("ota_pass", "OTA Password", ota_pass.c_str(), 40);
-  WiFiManagerParameter p_steps("steps_per_rev", "Steps per Revolution", String(steps_per_revolution).c_str(), 8);
+  WiFiManagerParameter p_steps("steps_per_rev", "Steps per Revolution", String(travel_steps).c_str(), 8);
 
   wm.addParameter(&p_hostname);
   wm.addParameter(&p_server);
@@ -2179,13 +2567,41 @@ void setup() {
   log_msg(LOG_INFO, "BOOT", "Reset reason: %s", reason_str);
 
   current_position = preferences.getInt("position", 0);
-  step_delay_us = preferences.getInt("step_delay", 2000);
+  motor_rpm = preferences.getInt("rpm", 0);
   motor_sleep_timeout = preferences.getULong("sleep_timeout", 30000);
-  steps_per_revolution = preferences.getInt("steps_per_rev", 2000);
+  travel_steps = preferences.getInt("steps_per_rev", 2000);
   motor_current_ma = preferences.getUShort("current_ma", 800);
-  motor_microsteps = preferences.getUShort("microsteps", 2);
+  // The default changed from 2 to 16. An install that predates the key was
+  // calibrated at 2, and travel_steps counts microsteps, so pin it to 2 there
+  // and give only genuinely new devices the new default.
+  if (!preferences.isKey("microsteps")) {
+    bool existing_install = preferences.isKey("steps_per_rev") ||
+                            preferences.isKey("position") ||
+                            preferences.isKey("step_delay");
+    uint16_t pinned = existing_install ? 2 : 16;
+    preferences.putUShort("microsteps", pinned);
+    log_msg(LOG_INFO, "BOOT", "No stored microsteps, using %d (%s install)",
+            pinned, existing_install ? "existing" : "new");
+  }
+  motor_microsteps = preferences.getUShort("microsteps", 16);
   stall_threshold = preferences.getUChar("stall_thr", 50);
+  cal_backoff_fullsteps = preferences.getInt("cal_backoff", 15);
   invert_direction = preferences.getBool("invert_dir", false);
+
+  // Speed used to be stored as a step interval; convert it once so existing
+  // tuning carries over
+  if (motor_rpm <= 0) {
+    int legacy_us = preferences.getInt("step_delay", 0);
+    if (legacy_us > 0) {
+      motor_rpm = 60000000L / ((long)legacy_us * MOTOR_FULL_STEPS_PER_REV * motor_microsteps);
+      log_msg(LOG_INFO, "BOOT", "Converted stored %dus/step to %d RPM", legacy_us, motor_rpm);
+    } else {
+      motor_rpm = 75;
+    }
+    motor_rpm = constrain(motor_rpm, 10, 300);
+    preferences.putInt("rpm", motor_rpm);
+  }
+  apply_motor_rpm();
 
   pinMode(STATUS_LED, OUTPUT);
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
@@ -2236,8 +2652,10 @@ void loop() {
   client.loop();
 
   if (ws_command_pending) {
+    String command(ws_pending_command);
     ws_command_pending = false;
-    process_command(ws_pending_command);
+    output("> %s\n", command.c_str());
+    process_command(command);
   }
 
   // Auto-sleep motor after inactivity
@@ -2245,6 +2663,14 @@ void loop() {
     if (millis() - last_motor_activity > motor_sleep_timeout) {
       sleep_motor();
     }
+  }
+
+  // Reap dead WebSocket clients: a browser that vanished (sleep, dropped WiFi)
+  // holds its slot until cleaned up, and the limit is 8
+  static unsigned long last_ws_cleanup = 0;
+  if (millis() - last_ws_cleanup > 5000) {
+    last_ws_cleanup = millis();
+    console_ws.cleanupClients();
   }
 
   // Periodic TMC error check (every 5 seconds when idle)

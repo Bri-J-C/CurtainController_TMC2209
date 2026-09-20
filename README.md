@@ -2,7 +2,7 @@
 
 ESP32-C3 based smart curtain controller with TMC2209 stepper driver, UART control, StallGuard4 sensorless homing, and Home Assistant integration via MQTT.
 
-**Firmware version: v5.4**
+**Firmware version: v5.5**
 
 ---
 
@@ -18,12 +18,12 @@ ESP32-C3 based smart curtain controller with TMC2209 stepper driver, UART contro
 
 | Function | GPIO | Notes |
 |----------|------|-------|
-| STEP | 10 | Step pulse output |
-| DIR | 6 | Direction control |
-| ENABLE | 0 | Driver enable (active LOW) |
-| DIAG | 7 | StallGuard interrupt input (active HIGH) |
-| TMC_RX | 20 | UART receive from TMC2209 PDN_UART |
-| TMC_TX | 21 | UART transmit to TMC2209 PDN_UART (via 1K resistor) |
+| STEP | 6 | Step pulse output |
+| DIR | 5 | Direction control |
+| ENABLE | 20 | Driver enable (active LOW) |
+| DIAG | 21 | StallGuard interrupt input (active HIGH) |
+| TMC_TX | 7 | UART transmit to the TMC2209 UART pin |
+| TMC_RX | 10 | UART receive from the TMC2209 UART pin |
 | STATUS_LED | 8 | Onboard LED (active LOW) |
 | RESET_BUTTON | 9 | Config portal / factory reset button |
 
@@ -34,11 +34,20 @@ GPIO 8 and 9 are strapping pins on the ESP32-C3 — they are used here for LED a
 ```
 ESP32-C3                TMC2209
 --------                -------
-GPIO 20 (RX) <--------- PDN_UART
-GPIO 21 (TX) ---[1K]--> PDN_UART
+GPIO 7  (TX) ---------> UART
+GPIO 10 (RX) <--------- UART
 ```
 
-Single-wire half-duplex UART: both RX and TX share the PDN_UART pin. The 1K resistor on TX prevents bus contention during driver responses. No address jumper is needed (driver address 0b00 is the default when MS1/MS2 are not pulled high).
+Single-wire half-duplex UART: TX and RX share the driver's UART pin.
+
+A series resistor in the TX leg is required, so the driver can pull the line low against the ESP32's
+idling-high TX output while it replies. Some modules have one built in on one of their two UART pads —
+if yours does not, or you are on the pad without it, fit a 1K resistor in the TX leg. Without it you get
+the request echoed back and no reply, which `tmcdiag` reports directly.
+
+No address jumper is needed — leaving MS1 and MS2 unconnected selects address 0.
+
+See [HARDWARE.md](HARDWARE.md) for the full wiring diagram, bill of materials and mounting notes.
 
 ---
 
@@ -48,7 +57,7 @@ Single-wire half-duplex UART: both RX and TX share the PDN_UART pin. The 1K resi
 - **Sensorless homing** using StallGuard4 — no end-stop switches required
 - **Auto-calibration** — finds the full travel range automatically and stores it; back-off margins set precise, repeatable endpoints
 - **Direction invert** — swap open/close direction via WebSerial command, MQTT switch entity, or setup page; persisted to NVS
-- **UART motor control** — current, microsteps, and stall threshold configurable at runtime without recompiling
+- **UART motor control** — current, microsteps, and stall threshold configurable at runtime without recompiling; motor current comes from the UART setting alone, not the module's VREF trimpot
 - **Home Assistant auto-discovery** — cover entity plus number/select/switch entities for all tunable parameters
 - **MQTT control** — open, close, stop, position (0–100%), and settings topics
 - **WebSerial console** at `/webserial` — full command interface over browser
@@ -77,7 +86,6 @@ Install these libraries via the Arduino Library Manager or `arduino-cli lib inst
 | ArduinoJson | MQTT discovery payload serialization |
 | TMCStepper | TMC2209 UART register access |
 | ESPAsyncWebServer | Async HTTP server for `/setup` and WebSerial |
-| MycilaWebSerial | Browser-based serial console |
 | ArduinoOTA | Over-the-air firmware updates |
 
 The ESP32-C3 Arduino core (espressif/arduino-esp32) is required. Install via the Arduino Boards Manager or arduino-cli.
@@ -191,10 +199,11 @@ Connect to `http://<device-ip>/webserial` or open a serial monitor at 115200 bau
 
 | Command | Description |
 |---------|-------------|
-| `speed <us>` | Step delay in microseconds (100–10000; lower = faster). Default: 2000 |
+| `speed <rpm>` | Shaft speed, 10–300 RPM. Default: 75. The step interval is derived from this and the microstep setting |
 | `current <mA>` | RMS motor current (100–2000 mA). Default: 800 |
-| `microsteps <n>` | Microstep resolution (1, 2, 4, 8, 16, 32, 64, 128, 256). Default: 2 |
+| `microsteps <n>` | Microstep resolution (1, 2, 4, 8, 16, 32, 64, 128, 256). Default: 16. Position and travel range are rescaled with it, and shaft speed is held constant |
 | `sensitivity <level>` | Stall sensitivity: `extra_low`, `low`, `medium`, `high`, `max`, or `custom <0-255>` |
+| `backoff <n>` | Full steps kept clear of each mechanical end after calibration. Default: 15 |
 | `invert` | Toggle open/close direction (persisted to NVS) |
 | `sleep <ms>` | Motor idle timeout in ms before driver disables (0 = never). Default: 30000 |
 | `travelsteps <n>` | Override total travel range in steps (1–500000) |
@@ -204,13 +213,14 @@ Connect to `http://<device-ip>/webserial` or open a serial monitor at 115200 bau
 | Command | Description |
 |---------|-------------|
 | `calibrate` | Run sensorless calibration — finds closed and open endpoints automatically |
-| `motortest [sec]` | Run motor for N seconds (default 5) using the same stall detector as calibration; reports SG_RESULT range, stall score, and a suggested `sensitivity custom N` |
+| `motortest [sec]` | Run motor for N seconds (default 5) using the same stall detector as calibration. Reports the free-running SG range, stall events with peak scores, UART read errors, and a suggested `sensitivity custom N`. `stop` aborts it |
 
 ### Diagnostics
 
 | Command | Description |
 |---------|-------------|
 | `status` | Current position, motor state, MQTT state, TMC2209 live registers |
+| `tmcdiag` | Probe the UART link: address scan, echo/reply split, write counter, and a decode of the driver's live registers |
 | `config` | Full configuration dump (hostname, IP, MQTT, all motor settings) |
 | `verbose` | Toggle StallGuard debug output during movement |
 | `loglevel <level>` | Set log level: `error`, `warn`, `info`, `debug` |
@@ -238,8 +248,8 @@ All topics are derived from the configured MQTT root topic (default: `home/room/
 | `<root>/position` | Publish | `0`–`100` | Current position percentage |
 | `<root>/availability` | Publish | `online` / `offline` | LWT availability |
 | `<root>/calibrate` | Subscribe | `press` | Trigger calibration |
-| `<root>/speed/set` | Subscribe | `100`–`10000` | Set step delay (us) |
-| `<root>/speed/state` | Publish | integer | Current step delay |
+| `<root>/speed_rpm/set` | Subscribe | `10`–`300` | Set shaft speed (RPM) |
+| `<root>/speed_rpm/state` | Publish | integer | Current shaft speed |
 | `<root>/current/set` | Subscribe | `100`–`2000` | Set motor current (mA) |
 | `<root>/current/state` | Publish | integer | Current motor current |
 | `<root>/stallthreshold/set` | Subscribe | `extra_low` / `low` / `medium` / `high` / `max` | Set stall sensitivity |
@@ -263,13 +273,25 @@ The device publishes MQTT auto-discovery payloads on first connect (and on `hadi
 |--------|------|-------------|
 | Cover | `cover` (device_class: curtain) | Open/close/stop/position control |
 | Calibrate | `button` | Triggers sensorless calibration |
-| Speed | `number` (100–10000 us, step 100) | Step delay / motor speed |
+| Speed | `number` (10–300 RPM, step 5) | Shaft speed |
 | Motor Current | `number` (100–2000 mA, step 100) | RMS current limit |
 | Stall Sensitivity | `select` (extra_low / low / medium / high / max) | StallGuard sensitivity preset |
 | Microsteps | `select` (1–256, powers of 2) | Microstep resolution |
 | Invert Direction | `switch` | Swap open/close direction |
 
 The cover entity uses `set_position_topic` pointing to the command topic, so HA position slider commands send a bare percentage number directly.
+
+---
+
+## Speed and microsteps
+
+Speed is stored as shaft RPM, and the step interval is derived from it and the current microstep
+setting. Changing microsteps therefore changes smoothness only — the curtain keeps moving at the same
+speed, and StallGuard tuning stays valid. Position and travel range are counted in microsteps, so both
+are rescaled when the resolution changes.
+
+StallGuard needs roughly 1 rev/s or more to read load reliably (60 RPM on a 200-step motor), and
+StealthChop's automatic tuning expects 60–300 RPM. Calibrate somewhere in that band.
 
 ---
 
@@ -314,9 +336,9 @@ During normal movement (non-calibration), stall events are logged in verbose mod
 Calibration uses StallGuard4 to find the mechanical travel limits without end-stop switches:
 
 1. The motor drives toward the closed (minimum) position until a stall is detected.
-2. The motor backs off 15 full steps (30 steps at the default 2 microsteps). This backed-off position is set as position 0 — the precise safe closed boundary.
+2. The motor backs off by the configured margin (`backoff`, 15 full steps by default). This backed-off position is set as position 0 — the safe closed boundary.
 3. The motor drives toward the open (maximum) position until a second stall is detected.
-4. The motor backs off 15 full steps from the open wall. The usable travel range is the total steps driven minus this open back-off.
+4. The motor backs off the same margin from the open wall. The usable travel range is the total steps driven minus this open back-off.
 5. The resulting travel range (in steps) is saved to NVS and HA discovery is re-published.
 
 If the measured travel is implausibly short (under 4× the back-off), calibration aborts instead of saving — that's almost always a false stall.
@@ -380,7 +402,7 @@ Or use the Arduino IDE's **Sketch > Upload Using Programmer** after selecting th
 
 ### TMC2209 not responding
 
-Check UART wiring: GPIO 21 (TX) through a 1K resistor to PDN_UART, GPIO 20 (RX) directly to PDN_UART. The resistor is required — without it, TX drives the bus low during driver responses and corrupts communication.
+Check UART wiring: GPIO 7 (TX) and GPIO 10 (RX) both go to the driver's UART pin. If the module has no series resistor on that pin, add a 1K resistor in the TX leg — without it, TX fights the driver during replies and corrupts reads. `motortest` reports UART read errors.
 
 ### Calibration stops too early
 
