@@ -925,7 +925,8 @@ void publish_ha_discovery(bool force) {
   cal_doc["object_id"] = device_hostname + "_calibrate";
   cal_doc["command_topic"] = mqtt_calibrate_topic;
   cal_doc["payload_press"] = "press";
-  cal_doc["availability_topic"] = mqtt_availability_topic;
+  cal_doc["entity_category"] = "config";
+    doc["availability_topic"] = mqtt_availability_topic;
   cal_doc["payload_available"] = "online";
   cal_doc["payload_not_available"] = "offline";
   cal_doc["icon"] = "mdi:tape-measure";
@@ -958,6 +959,7 @@ void publish_ha_discovery(bool force) {
     doc["step"] = 5;
     doc["unit_of_measurement"] = "RPM";
     doc["icon"] = "mdi:speedometer";
+    doc["entity_category"] = "config";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
@@ -984,6 +986,7 @@ void publish_ha_discovery(bool force) {
     doc["step"] = 100;
     doc["unit_of_measurement"] = "mA";
     doc["icon"] = "mdi:current-ac";
+    doc["entity_category"] = "config";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
@@ -1008,6 +1011,7 @@ void publish_ha_discovery(bool force) {
     JsonArray options = doc.createNestedArray("options");
     options.add("extra_low"); options.add("low"); options.add("medium"); options.add("high"); options.add("max");
     doc["icon"] = "mdi:gauge";
+    doc["entity_category"] = "config";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
@@ -1033,6 +1037,7 @@ void publish_ha_discovery(bool force) {
     options.add("1"); options.add("2"); options.add("4"); options.add("8");
     options.add("16"); options.add("32"); options.add("64"); options.add("128"); options.add("256");
     doc["icon"] = "mdi:stairs";
+    doc["entity_category"] = "config";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
@@ -1055,6 +1060,7 @@ void publish_ha_discovery(bool force) {
     doc["command_topic"] = mqtt_invert_set_topic;
     doc["state_topic"] = mqtt_invert_state_topic;
     doc["icon"] = "mdi:swap-horizontal";
+    doc["entity_category"] = "config";
     doc["availability_topic"] = mqtt_availability_topic;
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
@@ -2390,6 +2396,9 @@ void setup_wifi_manager() {
   log_msg(LOG_INFO, "WIFI", "Starting WiFi...");
 
   WiFi.mode(WIFI_STA);
+  // Modem sleep adds 100-200ms latency spikes, which bulk transfers like OTA
+  // tolerate badly on a weak signal
+  WiFi.setSleep(false);
   WiFi.setHostname(device_hostname.c_str());
 
   bool force_portal = check_button_hold_at_boot(3000);
@@ -2499,7 +2508,37 @@ void setup_ota() {
     }
     sleep_motor();
     if (client.connected()) client.disconnect();
-    esp_task_wdt_delete(NULL);
+    esp_task_wdt_delete(NULL);  // a flash write outlasts the watchdog period
+  });
+
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static unsigned int last_decile = 0;
+    unsigned int decile = total ? (done * 10) / total : 0;
+    if (decile != last_decile) {
+      last_decile = decile;
+      log_msg(LOG_INFO, "OTA", "%u%% (%u/%u bytes)", decile * 10, done, total);
+    }
+  });
+
+  ArduinoOTA.onEnd([]() {
+    log_msg(LOG_INFO, "OTA", "Update received, rebooting");
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    const char* reason;
+    switch (error) {
+      case OTA_AUTH_ERROR:    reason = "auth failed"; break;
+      case OTA_BEGIN_ERROR:   reason = "begin failed (partition too small?)"; break;
+      case OTA_CONNECT_ERROR: reason = "connect failed"; break;
+      case OTA_RECEIVE_ERROR: reason = "receive failed (link dropped)"; break;
+      case OTA_END_ERROR:     reason = "end failed (flash verify)"; break;
+      default:                reason = "unknown"; break;
+    }
+    log_msg(LOG_ERROR, "OTA", "Update failed: %s (code %d, update error %d)",
+            reason, (int)error, (int)Update.getError());
+
+    // The update is over either way, so put the watchdog back
+    esp_task_wdt_add(NULL);
   });
 
   ArduinoOTA.begin();
